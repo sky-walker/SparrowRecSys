@@ -1,3 +1,4 @@
 tensorflow==2.15.0
 tensorflow-metal
 pyspark==3.5.0
+psutil
