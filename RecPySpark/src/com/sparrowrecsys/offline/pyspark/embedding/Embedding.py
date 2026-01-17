@@ -17,6 +17,11 @@ Embedding.py - 推荐系统中的嵌入向量 (Embedding) 生成模块
 """
 
 import os
+
+# 设置 PySpark 使用的 Python 解释器，确保 driver 和 worker 使用相同版本
+os.environ['PYSPARK_PYTHON'] = '/opt/anaconda3/envs/sparrow/bin/python'
+os.environ['PYSPARK_DRIVER_PYTHON'] = '/opt/anaconda3/envs/sparrow/bin/python'
+
 from pyspark import SparkConf
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
