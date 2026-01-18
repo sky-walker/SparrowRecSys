@@ -84,23 +84,670 @@
 
 ## 三、核心模块设计
 
-### 3.1 召回模块（4路召回）
+### 3.1 召回模块设计（六路召回）
+
+#### 3.1.1 召回架构总览
+
+参考 SparrowRecSys 的多路召回设计，结合游戏推荐的特点，设计六路召回策略：
+
+```
+                         ┌─────────────────┐
+                         │   用户请求      │
+                         │   + 场景识别    │
+                         └────────┬────────┘
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │      用户类型判断          │
+                    │      新用户 / 活跃用户      │
+                    └─────────────┬─────────────┘
+                                  │
+     ┌──────────┬──────────┬──────┴──────┬──────────┬──────────┐
+     │          │          │             │          │          │
+     ▼          ▼          ▼             ▼          ▼          ▼
+┌────────┐┌────────┐┌────────────┐┌────────┐┌────────┐┌────────┐
+│Item-CF ││Embedding││  内容召回   ││热门召回││新游戏  ││个性化  │
+│(协同)  ││(向量)   ││(属性+标签) ││(多维度)││ 召回   ││ 召回   │
+└───┬────┘└───┬────┘└─────┬──────┘└───┬────┘└───┬────┘└───┬────┘
+    │         │           │           │         │         │
+    │ 动态    │  动态     │  固定     │ 动态    │  固定   │ 动态
+    │ 配额    │  配额     │  配额     │ 配额    │  配额   │ 配额
+    └─────────┴───────────┴───────────┴─────────┴─────────┘
+                                  │
+                                  ▼
+                       ┌─────────────────┐
+                       │  召回合并去重    │
+                       │   + 配额截断    │
+                       │  (~100个候选)   │
+                       └─────────────────┘
+```
+
+#### 3.1.2 召回配额分配策略
+
+基于用户生命周期阶段，动态调整各路召回配额：
 
 ```python
-# 召回策略设计
-召回配额分配 = {
-    "新用户": {"热门": 25, "内容": 15, "新游戏": 10, "Item-CF": 0},
-    "活跃用户": {"热门": 10, "内容": 10, "新游戏": 5, "Item-CF": 25},
-    "流失回归": {"热门": 15, "内容": 10, "新游戏": 5, "Item-CF": 20}
+# 召回策略设计 - 游戏推荐专用配额
+RECALL_QUOTA = {
+    "新用户": {           # 行为数 < 5
+        "hot": 30,        # 热门召回：高权重，保证体验
+        "content": 20,    # 内容召回：基于注册渠道/设备偏好
+        "new_game": 15,   # 新游戏：增加探索
+        "embedding": 10,  # Embedding：冷启动效果有限
+        "itemcf": 0,      # Item-CF：无历史数据
+        "personal": 0     # 个性化：无数据
+    },
+    "活跃用户": {         # 行为数 >= 5
+        "hot": 15,        # 热门：降权，增加个性化
+        "content": 15,    # 内容：稳定配额
+        "new_game": 10,   # 新游戏：适度曝光
+        "embedding": 25,  # Embedding：高权重
+        "itemcf": 25,     # Item-CF：高权重
+        "personal": 10    # 个性化：续玩/收藏
+    },
 }
 ```
 
-| 召回路 | 实现方式 | 配额 | 说明 |
-|--------|----------|------|------|
-| **热门召回** | Redis ZSET | 10-25 | 分时段/分类热门 |
-| **Item-CF** | 预计算相似矩阵 | 0-25 | 基于用户历史 |
-| **内容召回** | 属性匹配 | 10-15 | 基于用户偏好标签 |
-| **新游戏召回** | 强制池 | 5-10 | 7天内新游戏 |
+#### 3.1.3 Item-CF 协同过滤召回（参考 SparrowRecSys 实现）
+
+**核心原理：** 基于用户-物品交互矩阵，计算物品间相似度，为用户推荐与其历史偏好相似的游戏。
+
+**游戏场景特化：**
+- 游戏 Session 时长是重要权重因子（相比电影评分）
+- 投注行为比点击行为更具参考价值
+- 需要考虑游戏类目内/跨类目的相似性差异
+
+```python
+import math
+from collections import defaultdict
+from typing import List, Tuple, Dict, Set
+
+class GameItemCFRecall:
+    """
+    游戏 Item-CF 召回
+    参考 SparrowRecSys Embedding.scala 的协同过滤思想，
+    针对游戏场景进行优化：
+    1. 使用 IUF (Inverse User Frequency) 降低活跃用户权重
+    2. 加入游戏时长作为隐式反馈权重
+    3. 支持类目内/跨类目的相似度分别计算
+    """
+
+    def __init__(self):
+        self.item_similarity: Dict[str, Dict[str, float]] = {}
+        self.user_games: Dict[str, Set[str]] = {}
+        self.game_categories: Dict[str, str] = {}
+
+    def compute_similarity_matrix(
+        self,
+        interactions: List[Tuple[str, str, float, str]],  # (user_id, game_id, duration, category)
+        top_k_similar: int = 50
+    ):
+        """
+        计算游戏相似度矩阵
+
+        相似度公式 (改进的余弦相似度 + IUF):
+        sim(i,j) = Σ_u (w_u * duration_ui * duration_uj) / sqrt(|N(i)| * |N(j)|)
+
+        其中 w_u = 1 / log(1 + |N(u)|) 是 IUF 权重，降低活跃用户的贡献
+        """
+        # Step 1: 构建用户-游戏倒排索引
+        user_games = defaultdict(dict)  # {user: {game: duration}}
+        game_users = defaultdict(set)   # {game: set(users)}
+        game_categories = {}
+
+        for user_id, game_id, duration, category in interactions:
+            user_games[user_id][game_id] = duration
+            game_users[game_id].add(user_id)
+            game_categories[game_id] = category
+
+        self.user_games = {u: set(games.keys()) for u, games in user_games.items()}
+        self.game_categories = game_categories
+
+        # Step 2: 计算相似度
+        item_sim_scores = defaultdict(lambda: defaultdict(float))
+
+        for user_id, games in user_games.items():
+            game_list = list(games.keys())
+            # IUF 权重：活跃用户贡献降低
+            iuf_weight = 1.0 / math.log(1 + len(game_list))
+
+            for i, game_i in enumerate(game_list):
+                duration_i = games[game_i]
+                for game_j in game_list[i+1:]:
+                    duration_j = games[game_j]
+                    # 时长加权的共现贡献
+                    contribution = iuf_weight * math.sqrt(duration_i * duration_j)
+                    item_sim_scores[game_i][game_j] += contribution
+                    item_sim_scores[game_j][game_i] += contribution
+
+        # Step 3: 归一化并截取 Top-K
+        for game_i, related in item_sim_scores.items():
+            norm_i = len(game_users[game_i])
+            normalized = {}
+            for game_j, score in related.items():
+                norm_j = len(game_users[game_j])
+                normalized[game_j] = score / math.sqrt(norm_i * norm_j)
+
+            # 保留 Top-K 相似游戏
+            sorted_items = sorted(normalized.items(), key=lambda x: -x[1])
+            self.item_similarity[game_i] = dict(sorted_items[:top_k_similar])
+
+    def recall(
+        self,
+        user_id: str,
+        played_games: List[str],
+        top_k: int = 50,
+        filter_same_category: bool = False
+    ) -> List[Tuple[str, float]]:
+        """
+        为用户召回游戏
+
+        score(u, j) = Σ_{i∈N(u)} sim(i, j) * recency_weight(i)
+
+        参数:
+            filter_same_category: 是否只召回同类目游戏（分类页场景）
+        """
+        if not played_games:
+            return []
+
+        candidate_scores = defaultdict(float)
+        played_set = set(played_games)
+
+        # 时间衰减：最近玩的游戏权重更高
+        for idx, game_id in enumerate(reversed(played_games[-20:])):  # 最近20个
+            recency_weight = 1.0 / (1 + idx * 0.1)  # 越近权重越高
+
+            similar_games = self.item_similarity.get(game_id, {})
+            for sim_game_id, similarity in similar_games.items():
+                if sim_game_id in played_set:
+                    continue
+                if filter_same_category:
+                    if self.game_categories.get(sim_game_id) != self.game_categories.get(game_id):
+                        continue
+                candidate_scores[sim_game_id] += similarity * recency_weight
+
+        ranked = sorted(candidate_scores.items(), key=lambda x: -x[1])
+        return ranked[:top_k]
+```
+
+#### 3.1.4 Embedding 向量召回（参考 SparrowRecSys Item2Vec）
+
+**核心原理：** 借鉴 Word2Vec 的思想，将用户的游戏序列视为"句子"，游戏ID视为"单词"，学习游戏的稠密向量表示。
+
+**游戏场景特化：**
+- 游戏 Session 通常较短（几分钟），序列构建需考虑时间窗口
+- 加入游戏属性（category, provider, volatility）增强语义
+- 支持跨类目的向量相似度计算
+
+```python
+from pyspark.mllib.feature import Word2Vec
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, collect_list, udf, array_join
+from pyspark.sql.types import ArrayType, StringType
+import numpy as np
+import faiss
+
+class GameEmbeddingRecall:
+    """
+    游戏 Embedding 召回
+    参考 SparrowRecSys Embedding.py 的 Item2Vec 实现，
+    针对游戏场景优化：
+    1. 使用游戏 Session 序列而非评分序列
+    2. 窗口大小适配游戏浏览特点（较短的浏览路径）
+    3. 加入游戏属性增强 Embedding 语义
+    """
+
+    def __init__(self, embedding_dim: int = 64):
+        self.embedding_dim = embedding_dim
+        self.game_embeddings: Dict[str, np.ndarray] = {}
+        self.faiss_index = None
+        self.game_id_list: List[str] = []
+
+    def process_game_sequences(self, spark: SparkSession, behavior_path: str):
+        """
+        处理用户行为数据，生成游戏序列
+
+        参考 SparrowRecSys processItemSequence 函数：
+        1. 读取用户行为日志
+        2. 筛选有效行为（play/bet，时长>30秒）
+        3. 按用户分组，时间排序，生成序列
+        """
+        behaviors = spark.read.parquet(behavior_path)
+
+        # 自定义排序函数
+        def sort_by_time(game_list, time_list):
+            pairs = sorted(zip(game_list, time_list), key=lambda x: x[1])
+            return [str(x[0]) for x in pairs]
+
+        sort_udf = udf(sort_by_time, ArrayType(StringType()))
+
+        # 数据处理流水线
+        user_sequences = behaviors \
+            .where((col("behavior_type").isin(["play", "bet"])) &
+                   (col("duration") >= 30)) \
+            .groupBy("user_id") \
+            .agg(
+                sort_udf(
+                    collect_list("game_id"),
+                    collect_list("created_at")
+                ).alias("game_sequence")
+            )
+
+        return user_sequences.select("game_sequence").rdd.map(lambda x: x[0])
+
+    def train_game2vec(self, spark: SparkSession, sequences_rdd, output_path: str):
+        """
+        训练 Game2Vec 模型
+
+        参考 SparrowRecSys trainItem2vec 函数
+        """
+        word2vec = Word2Vec() \
+            .setVectorSize(self.embedding_dim) \
+            .setWindowSize(3) \
+            .setNumIterations(15)
+        # 游戏场景窗口设为3（比电影场景小，因为游戏浏览路径较短）
+
+        model = word2vec.fit(sequences_rdd)
+
+        # 保存 Embedding
+        for game_id in model.getVectors().keys():
+            vector = model.getVectors()[game_id]
+            self.game_embeddings[game_id] = np.array(vector)
+
+        # 构建 FAISS 索引
+        self._build_faiss_index()
+
+        return model
+
+    def _build_faiss_index(self):
+        """
+        构建 FAISS 向量索引，用于高效近邻搜索
+
+        参考 SparrowRecSys 的向量检索设计
+        """
+        self.game_id_list = list(self.game_embeddings.keys())
+        embeddings = np.array([self.game_embeddings[gid] for gid in self.game_id_list])
+        embeddings = embeddings.astype('float32')
+
+        # L2 归一化（用于余弦相似度）
+        faiss.normalize_L2(embeddings)
+
+        # 对于小规模游戏库（<1000），使用精确搜索
+        # 大规模时可改用 IndexIVFPQ
+        self.faiss_index = faiss.IndexFlatIP(self.embedding_dim)
+        self.faiss_index.add(embeddings)
+
+    def recall(
+        self,
+        user_embedding: np.ndarray,
+        top_k: int = 50,
+        exclude_games: Set[str] = None
+    ) -> List[Tuple[str, float]]:
+        """
+        基于用户 Embedding 的向量召回
+        """
+        if self.faiss_index is None:
+            return []
+
+        exclude_games = exclude_games or set()
+
+        # 归一化用户向量
+        user_vec = user_embedding.astype('float32').reshape(1, -1)
+        faiss.normalize_L2(user_vec)
+
+        # 多召回一些，用于过滤
+        scores, indices = self.faiss_index.search(user_vec, top_k * 2)
+
+        results = []
+        for idx, score in zip(indices[0], scores[0]):
+            if idx < 0:
+                continue
+            game_id = self.game_id_list[idx]
+            if game_id not in exclude_games:
+                results.append((game_id, float(score)))
+            if len(results) >= top_k:
+                break
+
+        return results
+
+    def compute_user_embedding(
+        self,
+        played_games: List[str],
+        durations: List[float] = None
+    ) -> np.ndarray:
+        """
+        计算用户 Embedding（聚合用户玩过的游戏 Embedding）
+
+        参考 SparrowRecSys generateUserEmb 函数，加入时长加权
+        """
+        if not played_games:
+            return np.zeros(self.embedding_dim)
+
+        embeddings = []
+        weights = []
+
+        for i, game_id in enumerate(played_games):
+            if game_id in self.game_embeddings:
+                embeddings.append(self.game_embeddings[game_id])
+                # 时长加权（如果提供）+ 时间衰减
+                duration_weight = math.sqrt(durations[i]) if durations else 1.0
+                recency_weight = 1.0 / (1 + (len(played_games) - i) * 0.05)
+                weights.append(duration_weight * recency_weight)
+
+        if not embeddings:
+            return np.zeros(self.embedding_dim)
+
+        # 加权平均
+        weights = np.array(weights) / sum(weights)
+        user_emb = np.average(embeddings, axis=0, weights=weights)
+
+        return user_emb
+```
+
+#### 3.1.5 内容召回（游戏属性匹配）
+
+**游戏特有属性：** category, provider, RTP, volatility, themes, features
+
+```python
+class GameContentRecall:
+    """
+    游戏内容召回：基于用户偏好与游戏属性匹配
+
+    游戏特有维度：
+    - category: Slots/Crash/Live/Virtual
+    - provider: Pragmatic Play/Spribe/Evolution
+    - volatility: high/medium/low（风险偏好）
+    - themes: mythology/animal/adventure/asian
+    - features: megaways/free_spins/bonus_buy
+    - rtp: 返还率区间
+    """
+
+    def __init__(self, redis_client):
+        self.redis = redis_client
+
+    async def recall(
+        self,
+        user_profile: dict,
+        top_k: int = 30,
+        exclude_games: Set[str] = None
+    ) -> List[Tuple[str, float]]:
+        """
+        基于用户画像的内容召回
+        """
+        exclude_games = exclude_games or set()
+        candidates = []
+
+        # 1. 偏好类目召回
+        preferred_categories = user_profile.get("preferred_categories", {})
+        for category, weight in sorted(preferred_categories.items(),
+                                        key=lambda x: -x[1])[:3]:
+            games = await self._get_games_by_category(category, limit=15)
+            for game in games:
+                if game["game_id"] not in exclude_games:
+                    candidates.append((game["game_id"], weight * 0.4))
+
+        # 2. 偏好提供商召回
+        preferred_providers = user_profile.get("preferred_providers", {})
+        for provider, weight in sorted(preferred_providers.items(),
+                                        key=lambda x: -x[1])[:2]:
+            games = await self._get_games_by_provider(provider, limit=10)
+            for game in games:
+                if game["game_id"] not in exclude_games:
+                    candidates.append((game["game_id"], weight * 0.3))
+
+        # 3. 风险偏好匹配（volatility）
+        risk_preference = user_profile.get("risk_preference", "medium")
+        games = await self._get_games_by_volatility(risk_preference, limit=10)
+        for game in games:
+            if game["game_id"] not in exclude_games:
+                candidates.append((game["game_id"], 0.2))
+
+        # 4. 主题偏好召回
+        preferred_themes = user_profile.get("preferred_themes", [])
+        for theme in preferred_themes[:3]:
+            games = await self._get_games_by_theme(theme, limit=8)
+            for game in games:
+                if game["game_id"] not in exclude_games:
+                    candidates.append((game["game_id"], 0.1))
+
+        # 合并去重，按分数排序
+        game_scores = defaultdict(float)
+        for game_id, score in candidates:
+            game_scores[game_id] += score
+
+        ranked = sorted(game_scores.items(), key=lambda x: -x[1])
+        return ranked[:top_k]
+```
+
+#### 3.1.6 热门召回（多维度）
+
+```python
+class GameHotRecall:
+    """
+    游戏热门召回：多维度热门榜单
+
+    游戏场景特点：
+    - 分时段热门（早/午/晚/深夜用户群体不同）
+    - 分类目热门（Slots/Crash 各有热门榜）
+    - 高 RTP 热门（部分用户偏好高返还率游戏）
+    - 实时热门（过去1小时的投注热度）
+    """
+
+    def __init__(self, redis_client):
+        self.redis = redis_client
+
+    async def recall(
+        self,
+        context: dict,  # 包含 time_period, category 等
+        top_k: int = 30,
+        exclude_games: Set[str] = None
+    ) -> List[Tuple[str, float]]:
+        """
+        多维度热门召回
+        """
+        exclude_games = exclude_games or set()
+        candidates = []
+
+        # 1. 实时热门（权重最高）
+        realtime_hot = await self.redis.zrevrange(
+            "game:hot:realtime", 0, 20, withscores=True
+        )
+        for game_id, score in realtime_hot:
+            if game_id not in exclude_games:
+                candidates.append((game_id, score * 0.4))
+
+        # 2. 分时段热门
+        time_period = context.get("time_period", "day")  # morning/afternoon/evening/night
+        period_hot = await self.redis.zrevrange(
+            f"game:hot:period:{time_period}", 0, 15, withscores=True
+        )
+        for game_id, score in period_hot:
+            if game_id not in exclude_games:
+                candidates.append((game_id, score * 0.3))
+
+        # 3. 分类目热门（如果有类目上下文）
+        category = context.get("category")
+        if category:
+            category_hot = await self.redis.zrevrange(
+                f"game:hot:category:{category}", 0, 15, withscores=True
+            )
+            for game_id, score in category_hot:
+                if game_id not in exclude_games:
+                    candidates.append((game_id, score * 0.3))
+
+        # 合并去重
+        game_scores = defaultdict(float)
+        for game_id, score in candidates:
+            game_scores[game_id] += score
+
+        # 归一化分数
+        if game_scores:
+            max_score = max(game_scores.values())
+            game_scores = {k: v/max_score for k, v in game_scores.items()}
+
+        ranked = sorted(game_scores.items(), key=lambda x: -x[1])
+        return ranked[:top_k]
+```
+
+#### 3.1.7 新游戏召回
+
+```python
+class NewGameRecall:
+    """
+    新游戏召回：保证新游戏曝光
+
+    使用 Thompson Sampling 平衡探索与利用
+    """
+
+    def __init__(self, redis_client, db_client):
+        self.redis = redis_client
+        self.db = db_client
+
+    async def recall(
+        self,
+        user_profile: dict,
+        top_k: int = 10
+    ) -> List[Tuple[str, float]]:
+        """
+        新游戏召回（上线7天内）
+        """
+        # 获取新游戏列表
+        new_games = await self.db.get_new_games(days=7)
+
+        if not new_games:
+            return []
+
+        # 使用 Thompson Sampling 选择
+        candidates = []
+        for game in new_games:
+            # Beta 分布采样
+            alpha = game.get("click_count", 1) + 1
+            beta = game.get("impression_count", 1) - game.get("click_count", 0) + 1
+            sampled_ctr = np.random.beta(alpha, beta)
+
+            # 内容相似度加成
+            content_bonus = self._compute_content_match(user_profile, game)
+
+            score = sampled_ctr * 0.7 + content_bonus * 0.3
+            candidates.append((game["game_id"], score))
+
+        ranked = sorted(candidates, key=lambda x: -x[1])
+        return ranked[:top_k]
+```
+
+#### 3.1.8 个性化召回（续玩 + 收藏）
+
+```python
+class PersonalRecall:
+    """
+    个性化召回：基于用户显式/隐式反馈
+
+    - 续玩召回：最近玩过但未完成 Session 的游戏
+    - 收藏召回：用户 Favorite 列表
+    """
+
+    async def recall(
+        self,
+        user_id: str,
+        top_k: int = 15
+    ) -> List[Tuple[str, float]]:
+        candidates = []
+
+        # 1. 续玩召回（最近3天玩过的游戏）
+        recent_games = await self.redis.lrange(f"user:recent:{user_id}", 0, 10)
+        for i, game_id in enumerate(recent_games):
+            recency_score = 1.0 / (1 + i * 0.1)
+            candidates.append((game_id, recency_score * 0.4))
+
+        # 2. 收藏召回
+        favorite_games = await self.db.get_user_favorites(user_id)
+        for game in favorite_games[:5]:
+            candidates.append((game["game_id"], 0.3))
+
+        # 去重
+        game_scores = {}
+        for game_id, score in candidates:
+            game_scores[game_id] = max(game_scores.get(game_id, 0), score)
+
+        ranked = sorted(game_scores.items(), key=lambda x: -x[1])
+        return ranked[:top_k]
+```
+
+#### 3.1.9 召回合并器
+
+```python
+class RecallMerger:
+    """
+    多路召回合并器
+
+    参考 SparrowRecSys multipleRetrievalCandidates 的多路召回合并思想
+    """
+
+    def __init__(self):
+        self.recall_sources = {}
+
+    async def merge(
+        self,
+        user_id: str,
+        user_type: str,
+        context: dict,
+        total_quota: int = 100
+    ) -> List[dict]:
+        """
+        合并多路召回结果
+        """
+        # 获取配额
+        quota = RECALL_QUOTA.get(user_type, RECALL_QUOTA["活跃用户"])
+
+        all_candidates = {}
+        recall_sources = {}
+
+        # 并行执行各路召回
+        tasks = [
+            ("itemcf", self.itemcf_recall.recall(user_id, ...)),
+            ("embedding", self.embedding_recall.recall(...)),
+            ("content", self.content_recall.recall(...)),
+            ("hot", self.hot_recall.recall(...)),
+            ("new_game", self.new_game_recall.recall(...)),
+            ("personal", self.personal_recall.recall(...)),
+        ]
+
+        results = await asyncio.gather(*[t[1] for t in tasks], return_exceptions=True)
+
+        for (source, _), result in zip(tasks, results):
+            if isinstance(result, Exception):
+                continue
+
+            source_quota = quota.get(source, 0)
+            for game_id, score in result[:source_quota]:
+                if game_id not in all_candidates:
+                    all_candidates[game_id] = score
+                    recall_sources[game_id] = source
+                else:
+                    # 多路命中的游戏，分数加成
+                    all_candidates[game_id] = max(all_candidates[game_id], score) * 1.1
+
+        # 按分数排序，截取 quota
+        sorted_candidates = sorted(all_candidates.items(), key=lambda x: -x[1])
+
+        return [
+            {
+                "game_id": game_id,
+                "recall_score": score,
+                "recall_source": recall_sources.get(game_id, "unknown")
+            }
+            for game_id, score in sorted_candidates[:total_quota]
+        ]
+```
+
+#### 3.1.10 召回模块评估指标
+
+| 指标类型 | 指标名称 | 说明 | 目标 |
+|----------|----------|------|------|
+| **覆盖率** | 召回覆盖率 | 被召回游戏占总游戏比例 | > 80% |
+| **命中率** | Recall@K | 用户实际点击在召回集中的比例 | > 60% |
+| **多样性** | 类目覆盖数 | 召回结果覆盖的类目数 | >= 3 |
+| **新鲜度** | 新游戏召回率 | 新游戏在召回结果中的占比 | > 10% |
+| **时效性** | 召回延迟 | 召回模块 P99 延迟 | < 20ms |
 
 ### 3.2 粗排模块（轻量双塔）
 
@@ -161,13 +808,249 @@ class ReRanker:
         return result
 ```
 
-### 3.5 冷启动策略
+### 3.5 冷启动策略（游戏场景专用）
 
-| 场景 | 策略 |
-|------|------|
-| **新用户** | 60%热门 + 20%新游戏 + 20%类目多样性 |
-| **新游戏** | 强制曝光池 + Thompson Sampling |
-| **流失回归** | 40%历史偏好 + 30%新游戏 + 30%热门 |
+游戏推荐系统面临两类冷启动问题：新用户、新游戏。以下是针对游戏场景的详细策略设计。
+
+#### 3.5.1 新用户冷启动
+
+**挑战：** 新用户无历史行为数据，无法使用协同过滤和 Embedding 召回。
+
+**策略：利用 Side Information（边信息）**
+
+```python
+class NewUserColdStart:
+    """
+    新用户冷启动策略
+
+    利用可获取的边信息进行初始推荐：
+    1. 注册渠道（不同渠道用户偏好不同）
+    2. 设备类型（iOS/Android/Web 用户行为差异）
+    3. 注册时间（时段偏好）
+    4. 地理位置（地区热门游戏差异）
+    5. 首次访问页面（入口意图）
+    """
+
+    # 渠道-类目偏好映射（基于历史数据统计）
+    CHANNEL_PREFERENCE = {
+        "organic": {"slots": 0.4, "crash": 0.3, "live": 0.2, "virtual": 0.1},
+        "facebook_ads": {"slots": 0.5, "crash": 0.2, "live": 0.2, "virtual": 0.1},
+        "google_ads": {"slots": 0.3, "crash": 0.4, "live": 0.2, "virtual": 0.1},
+        "affiliate": {"crash": 0.5, "slots": 0.3, "live": 0.1, "virtual": 0.1},
+    }
+
+    # 设备-风险偏好映射
+    DEVICE_RISK_PREFERENCE = {
+        "ios": "medium",      # iOS 用户偏保守
+        "android": "high",    # Android 用户偏激进
+        "web": "medium",
+    }
+
+    async def recommend(
+        self,
+        user_context: dict,
+        top_k: int = 50
+    ) -> List[dict]:
+        """
+        新用户推荐策略
+
+        配额分配：60% 热门 + 20% 新游戏 + 20% 类目多样性
+        """
+        channel = user_context.get("channel", "organic")
+        device = user_context.get("device", "web")
+        time_period = user_context.get("time_period", "day")
+
+        candidates = []
+
+        # 1. 热门召回（60%）- 按渠道偏好加权
+        channel_prefs = self.CHANNEL_PREFERENCE.get(channel, self.CHANNEL_PREFERENCE["organic"])
+        hot_quota = int(top_k * 0.6)
+
+        for category, weight in sorted(channel_prefs.items(), key=lambda x: -x[1]):
+            category_quota = int(hot_quota * weight)
+            hot_games = await self.hot_recall.recall(
+                context={"category": category, "time_period": time_period},
+                top_k=category_quota
+            )
+            for game_id, score in hot_games:
+                candidates.append({
+                    "game_id": game_id,
+                    "score": score * weight,
+                    "source": f"hot_{category}"
+                })
+
+        # 2. 新游戏召回（20%）- 增加探索
+        new_quota = int(top_k * 0.2)
+        new_games = await self.new_game_recall.recall(
+            user_profile={"risk_preference": self.DEVICE_RISK_PREFERENCE.get(device, "medium")},
+            top_k=new_quota
+        )
+        for game_id, score in new_games:
+            candidates.append({
+                "game_id": game_id,
+                "score": score * 0.8,
+                "source": "new_game"
+            })
+
+        # 3. 类目多样性（20%）- 确保覆盖所有类目
+        diversity_quota = int(top_k * 0.2)
+        existing_categories = set()
+        for c in candidates:
+            game_info = await self.game_service.get_game(c["game_id"])
+            existing_categories.add(game_info.get("category"))
+
+        for category in ["slots", "crash", "live", "virtual"]:
+            if category not in existing_categories:
+                category_games = await self.hot_recall.recall(
+                    context={"category": category},
+                    top_k=diversity_quota // 4
+                )
+                for game_id, score in category_games[:3]:
+                    candidates.append({
+                        "game_id": game_id,
+                        "score": score * 0.5,
+                        "source": f"diversity_{category}"
+                    })
+
+        # 去重排序
+        seen = set()
+        result = []
+        for c in sorted(candidates, key=lambda x: -x["score"]):
+            if c["game_id"] not in seen:
+                seen.add(c["game_id"])
+                result.append(c)
+
+        return result[:top_k]
+```
+
+#### 3.5.2 新游戏冷启动
+
+**挑战：** 新上线游戏无用户交互数据，无法计算协同过滤相似度和 Embedding。
+
+**策略：Thompson Sampling + 内容相似度**
+
+```python
+class NewGameColdStart:
+    """
+    新游戏冷启动策略
+
+    核心思想：
+    1. 使用 Thompson Sampling 平衡探索与利用
+    2. 利用游戏属性计算内容相似度，借用相似游戏的 Embedding
+    3. 强制曝光池保证最低曝光量
+    """
+
+    def __init__(self, db_client, redis_client):
+        self.db = db_client
+        self.redis = redis_client
+        self.min_impressions = 1000  # 最低曝光量
+
+    async def get_new_game_score(
+        self,
+        game: dict,
+        user_profile: dict
+    ) -> float:
+        """
+        计算新游戏的推荐分数
+
+        score = thompson_score * 0.5 + content_match * 0.3 + freshness * 0.2
+        """
+        # 1. Thompson Sampling 分数
+        alpha = game.get("click_count", 0) + 1
+        beta = game.get("impression_count", 0) - game.get("click_count", 0) + 1
+        thompson_score = np.random.beta(alpha, beta)
+
+        # 2. 内容匹配分数
+        content_match = self._compute_content_match(user_profile, game)
+
+        # 3. 新鲜度分数（越新分数越高）
+        days_since_launch = (datetime.now() - game["launch_date"]).days
+        freshness = max(0, 1 - days_since_launch / 7)  # 7天内线性衰减
+
+        # 4. 强制曝光加成（未达到最低曝光量的游戏）
+        if game.get("impression_count", 0) < self.min_impressions:
+            boost = 1.5
+        else:
+            boost = 1.0
+
+        score = (thompson_score * 0.5 + content_match * 0.3 + freshness * 0.2) * boost
+        return score
+
+    def _compute_content_match(self, user_profile: dict, game: dict) -> float:
+        """
+        计算用户画像与游戏属性的匹配度
+        """
+        score = 0.0
+
+        # 类目匹配
+        preferred_categories = user_profile.get("preferred_categories", {})
+        if game["category"] in preferred_categories:
+            score += preferred_categories[game["category"]] * 0.4
+
+        # 提供商匹配
+        preferred_providers = user_profile.get("preferred_providers", {})
+        if game["provider"] in preferred_providers:
+            score += preferred_providers[game["provider"]] * 0.3
+
+        # 风险偏好匹配
+        user_risk = user_profile.get("risk_preference", "medium")
+        game_volatility = game.get("volatility", "medium")
+        if user_risk == game_volatility:
+            score += 0.2
+
+        # 主题匹配
+        preferred_themes = set(user_profile.get("preferred_themes", []))
+        game_themes = set(game.get("themes", []))
+        if preferred_themes & game_themes:
+            score += 0.1
+
+        return min(score, 1.0)
+
+    async def borrow_embedding(self, new_game: dict) -> np.ndarray:
+        """
+        借用相似游戏的 Embedding（内容相似度加权平均）
+
+        对于新游戏，找到属性最相似的 K 个已有游戏，
+        加权平均它们的 Embedding 作为新游戏的初始 Embedding
+        """
+        # 找到同类目、同提供商的游戏
+        similar_games = await self.db.find_similar_games(
+            category=new_game["category"],
+            provider=new_game["provider"],
+            volatility=new_game.get("volatility"),
+            limit=10
+        )
+
+        if not similar_games:
+            return None
+
+        embeddings = []
+        weights = []
+
+        for game in similar_games:
+            emb = await self.redis.get(f"game:embedding:{game['game_id']}")
+            if emb:
+                embeddings.append(np.frombuffer(emb, dtype=np.float32))
+                # 相似度作为权重
+                sim = self._compute_game_similarity(new_game, game)
+                weights.append(sim)
+
+        if not embeddings:
+            return None
+
+        # 加权平均
+        weights = np.array(weights) / sum(weights)
+        borrowed_emb = np.average(embeddings, axis=0, weights=weights)
+
+        return borrowed_emb
+```
+
+#### 3.5.3 冷启动策略总结
+
+| 场景 | 策略 | 配额分配 | 关键技术 |
+|------|------|----------|----------|
+| **新用户** | Side Information + 热门 + 多样性 | 60%热门 + 20%新游戏 + 20%多样性 | 渠道偏好映射、设备风险偏好 |
+| **新游戏** | Thompson Sampling + 内容相似 | 强制曝光池 + 动态配额 | Beta分布采样、Embedding借用 |
 
 ---
 
@@ -223,7 +1106,7 @@ CREATE TABLE user_profile (
     register_time TIMESTAMP,
     last_active_time TIMESTAMP,
     user_level INT,
-    lifecycle_stage VARCHAR(20),  -- new/active/churn
+    lifecycle_stage VARCHAR(20),  -- new/active
     preferred_categories JSONB,   -- {"Slots": 0.6, "Crash": 0.3}
     preferred_providers JSONB,
     total_play_count INT,
