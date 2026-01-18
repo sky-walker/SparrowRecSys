@@ -68,31 +68,93 @@
 
 ### 3.1 核心表结构 (仅 4 张表)
 
-#### 3.1.1 用户表 (users)
+#### 3.1.1 用户特征表 (users)
+
+> **设计说明**：参考 `algo_user_features` 表结构，整合用户基础信息与算法特征到一张表，
+> 简化 MVP 版本的表结构。字段命名与算法模块保持一致，便于后续迁移到独立特征表。
 
 ```sql
 CREATE TABLE users (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id VARCHAR(64) NOT NULL COMMENT '用户唯一标识',
-    username VARCHAR(128) DEFAULT NULL,
-    register_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    register_channel VARCHAR(64) DEFAULT NULL COMMENT '注册渠道',
-    register_device VARCHAR(32) DEFAULT NULL COMMENT '设备类型: ios/android/web',
-    last_active_time DATETIME DEFAULT NULL,
-    status TINYINT UNSIGNED DEFAULT 1 COMMENT '1-正常 2-VIP',
-    
-    -- 用户画像字段 (MVP 简化：合并到用户表)
-    preferred_categories JSON DEFAULT NULL COMMENT '类目偏好: {"slots": 0.5, "crash": 0.3}',
-    preferred_providers JSON DEFAULT NULL COMMENT '提供商偏好',
-    behavior_count INT UNSIGNED DEFAULT 0 COMMENT '总行为数',
-    
+    -- ============ 主键 ============
+    user_id VARCHAR(64) NOT NULL PRIMARY KEY COMMENT '用户ID (业务主键)',
+
+    -- ============ 用户基础信息 ============
+    username VARCHAR(128) DEFAULT NULL COMMENT '用户名',
+    register_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '注册时间',
+    last_active_time DATETIME DEFAULT NULL COMMENT '最后活跃时间',
+    status TINYINT UNSIGNED DEFAULT 1 COMMENT '状态: 0-禁用 1-正常 2-VIP',
+
+    -- ============ 用户基础特征 (算法用) ============
+    -- 生命周期 (与 algo_user_features 字段一致)
+    lifecycle_stage TINYINT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT '生命周期: 0-new 1-growth 2-active 3-mature 4-decline 5-churn',
+    register_days INT UNSIGNED DEFAULT 0 COMMENT '注册天数 (T+1更新)',
+    active_days_7d TINYINT UNSIGNED DEFAULT 0 COMMENT '近7天活跃天数',
+    active_days_30d TINYINT UNSIGNED DEFAULT 0 COMMENT '近30天活跃天数',
+
+    -- 设备与渠道 (用于冷启动)
+    register_channel_id SMALLINT UNSIGNED DEFAULT 0
+        COMMENT '注册渠道ID: 0-unknown 1-organic 2-facebook 3-google 4-affiliate',
+    register_device_id TINYINT UNSIGNED DEFAULT 0
+        COMMENT '注册设备ID: 0-unknown 1-ios 2-android 3-web',
+
+    -- ============ 用户偏好特征 (算法用) ============
+    -- 类目偏好 (归一化概率分布, 4个类目总和=1)
+    pref_category_slots DECIMAL(4,3) DEFAULT 0.250 COMMENT 'Slots偏好度 0-1',
+    pref_category_crash DECIMAL(4,3) DEFAULT 0.250 COMMENT 'Crash偏好度 0-1',
+    pref_category_live DECIMAL(4,3) DEFAULT 0.250 COMMENT 'Live偏好度 0-1',
+    pref_category_virtual DECIMAL(4,3) DEFAULT 0.250 COMMENT 'Virtual偏好度 0-1',
+
+    -- Top3偏好提供商 (ID编码, MVP只用Top1)
+    pref_provider_1 SMALLINT UNSIGNED DEFAULT 0 COMMENT '最偏好提供商ID',
+    -- [MVP后续] pref_provider_2, pref_provider_3
+
+    -- 风险偏好
+    risk_preference TINYINT UNSIGNED DEFAULT 1 COMMENT '风险偏好: 0-low 1-medium 2-high',
+
+    -- ============ 用户行为统计特征 (算法用) ============
+    -- 总量统计
+    total_play_count INT UNSIGNED DEFAULT 0 COMMENT '累计游戏次数',
+    total_play_duration BIGINT UNSIGNED DEFAULT 0 COMMENT '累计游戏时长(秒)',
+    -- [MVP后续] total_bet_amount, total_win_amount
+
+    -- 近期统计 (7天, 用于活跃度判断)
+    play_count_7d INT UNSIGNED DEFAULT 0 COMMENT '7天游戏次数',
+    distinct_games_7d SMALLINT UNSIGNED DEFAULT 0 COMMENT '7天玩过的不同游戏数',
+    -- [MVP后续] play_duration_7d, bet_amount_7d
+
+    -- 投注模式 (MVP简化: 只保留平均投注)
+    avg_bet_amount DECIMAL(10,2) DEFAULT 0.00 COMMENT '平均单次投注',
+    -- [MVP后续] bet_pattern, avg_session_duration
+
+    -- ============ 版本控制 ============
+    feature_version VARCHAR(16) DEFAULT 'v1.0' COMMENT '特征版本',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    UNIQUE KEY uk_user_id (user_id),
-    KEY idx_last_active (last_active_time)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='用户表 (含算法特征) - MVP版本';
+
+-- ============ 索引策略 ============
+-- 主键查询为主，算法模块直接用 user_id 查询
+-- 冷启动召回：按渠道+设备查询热门偏好
+CREATE INDEX idx_channel_device ON users(register_channel_id, register_device_id);
+-- 用户生命周期分析
+CREATE INDEX idx_lifecycle ON users(lifecycle_stage, active_days_7d);
 ```
+
+**字段说明：**
+
+| 字段分类 | MVP 保留 | 后续版本添加 |
+|----------|----------|--------------|
+| 生命周期 | lifecycle_stage, register_days, active_days_7d/30d | - |
+| 渠道设备 | register_channel_id, register_device_id | - |
+| 类目偏好 | pref_category_* (4个) | - |
+| 提供商偏好 | pref_provider_1 | pref_provider_2/3 |
+| 风险偏好 | risk_preference | risk_score |
+| 行为统计 | total_play_count, play_count_7d | bet_amount, win_amount |
+| 投注模式 | avg_bet_amount | bet_pattern, avg_session_duration |
+| 交叉特征 | - | ctr_category_* (4个类目CTR) |
 
 #### 3.1.2 游戏表 (games)
 
@@ -249,13 +311,31 @@ class ItemCFRecall:
 
 ```python
 class ContentRecall:
-    """内容召回：基于用户偏好匹配游戏属性"""
+    """
+    内容召回：基于用户偏好匹配游戏属性
+    使用 users 表中的 pref_category_* 字段
+    """
 
-    async def recall(self, user_profile: dict, top_k: int = 10) -> List[dict]:
-        preferred_category = max(
-            user_profile.get("preferred_categories", {"slots": 1}).items(),
-            key=lambda x: x[1]
-        )[0]
+    async def recall(self, user_id: str, top_k: int = 10) -> List[dict]:
+        # 获取用户类目偏好 (与 algo_user_features 字段一致)
+        user = await self.db.query_one("""
+            SELECT pref_category_slots, pref_category_crash,
+                   pref_category_live, pref_category_virtual,
+                   pref_provider_1
+            FROM users WHERE user_id = %s
+        """, (user_id,))
+
+        if not user:
+            return []
+
+        # 找到最高偏好的类目
+        category_prefs = {
+            "slots": user["pref_category_slots"],
+            "crash": user["pref_category_crash"],
+            "live": user["pref_category_live"],
+            "virtual": user["pref_category_virtual"]
+        }
+        preferred_category = max(category_prefs.items(), key=lambda x: x[1])[0]
 
         # 从偏好类目中召回热门游戏
         games = await self.db.query("""
@@ -274,11 +354,11 @@ class ContentRecall:
 class RecallMerger:
     """多路召回合并"""
 
-    async def merge(self, user_id: str, user_profile: dict, category: str = None) -> List[dict]:
-        # 并行执行三路召回
+    async def merge(self, user_id: str, category: str = None) -> List[dict]:
+        # 并行执行三路召回 (使用 user_id 查询用户特征)
         hot_task = self.hot_recall.recall(category, top_k=20)
         cf_task = self.itemcf_recall.recall(user_id, top_k=20)
-        content_task = self.content_recall.recall(user_profile, top_k=10)
+        content_task = self.content_recall.recall(user_id, top_k=10)  # 内部查询 users 表
 
         results = await asyncio.gather(hot_task, cf_task, content_task)
 
@@ -300,12 +380,25 @@ class RecallMerger:
 
 ### 5.1 特征设计 (精简版)
 
-| 特征类型 | 特征 | 处理方式 |
-|----------|------|----------|
-| 用户特征 | user_id, 注册天数, 行为数 | Embedding + 数值 |
-| 游戏特征 | game_id, category, provider, rtp | Embedding + 数值 |
-| 交叉特征 | user×category偏好度 | 在线计算 |
-| 上下文 | 时段, 设备类型 | Embedding |
+> 特征字段与 `users` 表、`games` 表字段对应
+
+| 特征类型 | 字段名 | 来源表 | 处理方式 |
+|----------|--------|--------|----------|
+| **用户ID** | user_id | users | Embedding |
+| **用户生命周期** | lifecycle_stage | users | Embedding (0-5) |
+| **注册天数** | register_days | users | 数值 (离散化) |
+| **7天活跃** | active_days_7d | users | 数值 |
+| **类目偏好** | pref_category_* | users | 4个数值特征 |
+| **风险偏好** | risk_preference | users | Embedding (0-2) |
+| **游戏ID** | game_id | games | Embedding |
+| **游戏类目** | category | games | Embedding |
+| **游戏RTP** | rtp | games | 数值 |
+| **设备类型** | register_device_id | users | Embedding (0-3) |
+
+**后续版本添加的特征：**
+- 用户各类目CTR (ctr_category_*)
+- 用户行为序列 (DIN Attention)
+- 用户实时特征 (Session内行为)
 
 ### 5.2 DeepFM 模型结构
 
@@ -387,29 +480,44 @@ def rerank(ranked_list: List[dict], max_same_category: int = 2) -> List[dict]:
 ### 6.1 新用户冷启动
 
 ```python
-async def cold_start_for_new_user(user_context: dict) -> List[dict]:
+# 渠道ID映射 (与 users.register_channel_id 一致)
+CHANNEL_ID_MAP = {0: "unknown", 1: "organic", 2: "facebook", 3: "google", 4: "affiliate"}
+# 设备ID映射 (与 users.register_device_id 一致)
+DEVICE_ID_MAP = {0: "unknown", 1: "ios", 2: "android", 3: "web"}
+
+# 渠道 → 类目偏好映射
+CHANNEL_CATEGORY_PREF = {
+    1: "slots",      # organic → slots
+    2: "slots",      # facebook → slots
+    3: "crash",      # google → crash
+    4: "crash",      # affiliate → crash
+    0: "slots"       # unknown → slots (默认)
+}
+
+async def cold_start_for_new_user(user_id: str) -> List[dict]:
     """
     新用户策略：70% 热门 + 30% 多样性
-    利用注册渠道和设备信息
+    利用 users 表中的 register_channel_id 和 register_device_id
     """
-    channel = user_context.get("channel", "organic")
+    # 获取用户注册渠道和设备
+    user = await db.query_one("""
+        SELECT register_channel_id, register_device_id, lifecycle_stage
+        FROM users WHERE user_id = %s
+    """, (user_id,))
 
-    # 渠道偏好映射
-    CHANNEL_PREF = {
-        "organic": "slots",
-        "facebook_ads": "slots",
-        "google_ads": "crash",
-        "affiliate": "crash"
-    }
+    if not user or user["lifecycle_stage"] != 0:  # 0 = new
+        return []
 
-    preferred_cat = CHANNEL_PREF.get(channel, "slots")
+    channel_id = user["register_channel_id"] or 0
+    preferred_cat = CHANNEL_CATEGORY_PREF.get(channel_id, "slots")
 
     # 70% 偏好类目热门
     hot_games = await hot_recall.recall(preferred_cat, top_k=7)
 
     # 30% 其他类目多样性
     other_cats = ["slots", "crash", "live", "virtual"]
-    other_cats.remove(preferred_cat) if preferred_cat in other_cats else None
+    if preferred_cat in other_cats:
+        other_cats.remove(preferred_cat)
     diversity_games = []
     for cat in other_cats:
         games = await hot_recall.recall(cat, top_k=1)

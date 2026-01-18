@@ -2,5 +2,12 @@
     "files.watcherExclude": {
         "**/target": true
     },
-    "java.compile.nullAnalysis.mode": "automatic"
+    "java.compile.nullAnalysis.mode": "automatic",
+      // 禁用预览模式
+    "workbench.editor.enablePreview": false,
+    // 禁用从 Quick Open 预览
+    "workbench.editor.enablePreviewFromQuickOpen": false,
+    
+    // 可选：标签页过多时是否换行显示
+    "workbench.editor.wrapTabs": true
 }
