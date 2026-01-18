@@ -1087,6 +1087,1188 @@ CREATE INDEX idx_status ON algo_game_features(status);
 
 ---
 
+#### 2.2.1 特征计算逻辑详解
+
+> **时间定义约定**：
+>
+> - T：当前计算日期（通常为昨日23:59:59）
+> - 近N天：`[T-N+1, T]` 闭区间
+> - 近N小时：`[NOW - N hours, NOW]`
+
+##### 一、游戏基础属性
+
+###### 1. game_id（游戏ID）
+
+| 属性               | 说明                               |
+| ------------------ | ---------------------------------- |
+| **业务含义** | 游戏唯一标识，贯穿整个推荐链路     |
+| **数据来源** | `overseas_casino_game.s_game_id` |
+| **更新频率** | 随游戏上架同步                     |
+| **数据类型** | VARCHAR(64)，第三方游戏ID          |
+
+**计算逻辑：**
+
+```sql
+-- 直接映射，保持原值
+SELECT s_game_id AS game_id
+FROM overseas_casino_game
+WHERE n_status = 1  -- 只同步上线游戏
+```
+
+**边界情况：**
+
+- 新上架游戏：实时同步或T+1批量新增
+- 下架游戏：`status` 更新为0，但保留记录（用于历史数据关联）
+
+---
+
+###### 2. category_id（类目ID）
+
+| 属性               | 说明                                                    |
+| ------------------ | ------------------------------------------------------- |
+| **业务含义** | 游戏所属大类，用于分类召回和类目偏好匹配                |
+| **数据来源** | `overseas_casino_game.n_type` + `overseas_category` |
+| **取值范围** | 0-unknown, 1-slots, 2-crash, 3-live, 4-virtual          |
+| **更新频率** | T+1（游戏分类变更较少）                                 |
+
+**编码映射表：**
+
+```sql
+-- 从业务表的分类关联提取并编码
+-- overseas_casino_game.n_type → overseas_category.s_value.type
+
+-- 编码映射规则
+-- n_type 对应 overseas_category 表的 JSON(s_value.type)
+-- 最终编码到 category_id
+
+CREATE TABLE dim_category_mapping (
+    business_type INT COMMENT 'overseas_casino_game.n_type',
+    category_id TINYINT UNSIGNED COMMENT '算法模块类目ID',
+    category_name VARCHAR(32) COMMENT '类目名称',
+    PRIMARY KEY (business_type)
+);
+
+-- 示例映射数据（需根据实际 overseas_category 配置确定）
+INSERT INTO dim_category_mapping VALUES
+(1, 1, 'slots'),      -- 老虎机
+(2, 2, 'crash'),      -- Crash游戏
+(3, 3, 'live'),       -- 真人娱乐
+(4, 4, 'virtual'),    -- 虚拟体育
+(NULL, 0, 'unknown'); -- 未分类
+```
+
+**计算SQL：**
+
+```sql
+SELECT
+    ocg.s_game_id AS game_id,
+    COALESCE(dcm.category_id, 0) AS category_id
+FROM overseas_casino_game ocg
+LEFT JOIN dim_category_mapping dcm ON ocg.n_type = dcm.business_type
+WHERE ocg.n_status = 1
+```
+
+**边界情况：**
+
+- `n_type` 为 NULL：`category_id = 0` (unknown)
+- `n_type` 不在映射表：`category_id = 0` (unknown)
+
+---
+
+###### 3. provider_id（提供商ID）
+
+| 属性               | 说明                                       |
+| ------------------ | ------------------------------------------ |
+| **业务含义** | 游戏供应商，用于提供商偏好召回和多样性打散 |
+| **数据来源** | `overseas_casino_game.s_agent_code`      |
+| **更新频率** | T+1（提供商变更极少）                      |
+
+**编码映射表：**
+
+```sql
+-- 提供商编码映射表
+CREATE TABLE dim_provider_mapping (
+    agent_code VARCHAR(50) COMMENT 'overseas_casino_game.s_agent_code',
+    provider_id SMALLINT UNSIGNED COMMENT '算法模块提供商ID',
+    provider_name VARCHAR(64) COMMENT '提供商名称',
+    PRIMARY KEY (agent_code)
+);
+
+-- 示例映射数据（根据订单明细表的 s_provider 字段整理）
+-- 实际 agent_code 需从 overseas_casino_game 表统计获取
+INSERT INTO dim_provider_mapping VALUES
+('PP', 1, 'Pragmatic Play'),
+('EVO', 2, 'Evolution Gaming'),
+('PG', 3, 'PG Soft'),
+('SP', 4, 'SP Gaming'),
+('NET', 5, 'NetEnt'),
+-- ... 其他提供商
+('UNKNOWN', 0, 'Unknown');
+```
+
+**计算SQL：**
+
+```sql
+SELECT
+    ocg.s_game_id AS game_id,
+    COALESCE(dpm.provider_id, 0) AS provider_id
+FROM overseas_casino_game ocg
+LEFT JOIN dim_provider_mapping dpm ON ocg.s_agent_code = dpm.agent_code
+WHERE ocg.n_status = 1
+```
+
+**边界情况：**
+
+- `s_agent_code` 为 NULL 或空：`provider_id = 0`
+- 新提供商未入映射表：需定期扫描补充映射
+
+---
+
+###### 4. rtp（RTP返还率）
+
+| 属性               | 说明                                       |
+| ------------------ | ------------------------------------------ |
+| **业务含义** | 游戏的长期理论返还率，用于用户风险偏好匹配 |
+| **数据来源** | `overseas_casino_game.n_hit_rate`        |
+| **取值范围** | 通常在 92.00-98.00 之间，部分游戏可能超出  |
+| **更新频率** | T+1（RTP由供应商设定，较稳定）             |
+
+**计算逻辑：**
+
+```sql
+-- 直接映射，保留2位小数
+SELECT
+    s_game_id AS game_id,
+    ROUND(n_hit_rate, 2) AS rtp
+FROM overseas_casino_game
+WHERE n_status = 1
+```
+
+**数据处理规则：**
+
+```python
+def process_rtp(n_hit_rate):
+    """
+    RTP数据清洗规则：
+    1. NULL值：保持NULL，精排模型需处理缺失
+    2. 异常值检测：RTP通常在88-99%之间
+    3. 超出范围的需人工审核
+    """
+    if n_hit_rate is None:
+        return None
+
+    rtp = float(n_hit_rate)
+
+    # 异常值检测
+    if rtp < 80 or rtp > 100:
+        # 记录异常日志，返回NULL
+        log_warning(f"RTP异常值: {rtp}")
+        return None
+
+    return round(rtp, 2)
+```
+
+**边界情况：**
+
+| 情况                   | 处理方式                                 |
+| ---------------------- | ---------------------------------------- |
+| `n_hit_rate` 为 NULL | 保持 NULL，精排模型使用默认值（如95.00） |
+| RTP < 50 或 > 100      | 视为异常，记录日志并置为 NULL            |
+| 数据精度问题           | 四舍五入保留2位小数                      |
+
+**在推荐系统中的作用：**
+
+- 用户风险偏好匹配：高RTP（>97%）适合保守型用户，低RTP（<94%）适合激进型用户
+- 精排模型特征输入
+
+---
+
+###### 5. volatility / volatility_score（波动性）
+
+| 属性               | 说明                                                 |
+| ------------------ | ---------------------------------------------------- |
+| **业务含义** | 游戏收益的波动程度，高波动=稀少大奖，低波动=频繁小奖 |
+| **数据来源** | **⚠️ 业务表无此字段，暂为 NULL**             |
+| **取值范围** | volatility: 0-low 1-medium 2-high 3-very_high        |
+| **更新频率** | 待供应商提供数据后启用                               |
+
+**数据缺失处理方案：**
+
+```python
+def get_volatility_fallback(game_id, rtp, category_id, features):
+    """
+    波动性数据缺失的临时处理方案：
+    基于现有数据推断波动性（仅作为降级方案）
+
+    推断规则：
+    1. Crash类游戏通常高波动 → 返回 2 (high)
+    2. Live类游戏通常低波动 → 返回 0 (low)
+    3. Slots根据RTP和特性推断
+    """
+    # 方案1：基于类目的默认值
+    CATEGORY_DEFAULT_VOLATILITY = {
+        1: 1,  # slots → medium
+        2: 2,  # crash → high
+        3: 0,  # live → low
+        4: 1,  # virtual → medium
+        0: 1,  # unknown → medium
+    }
+
+    # 方案2：如果有 Megaways 特性，通常是高波动
+    if features and 'megaways' in features.lower():
+        return 2  # high
+
+    # 方案3：Jackpot游戏通常高波动
+    if features and 'jackpot' in features.lower():
+        return 2  # high
+
+    return CATEGORY_DEFAULT_VOLATILITY.get(category_id, 1)
+```
+
+**未来数据补充方案：**
+
+```sql
+-- 当从供应商获取到波动性数据后，更新字段
+UPDATE algo_game_features agf
+JOIN supplier_game_data sgd ON agf.game_id = sgd.game_id
+SET
+    agf.volatility = CASE sgd.volatility_level
+        WHEN 'low' THEN 0
+        WHEN 'medium' THEN 1
+        WHEN 'high' THEN 2
+        WHEN 'very_high' THEN 3
+        ELSE NULL
+    END,
+    agf.volatility_score = sgd.volatility_numeric
+WHERE sgd.volatility_level IS NOT NULL
+```
+
+---
+
+###### 6. min_bet / max_bet（投注范围）
+
+| 属性               | 说明                                                 |
+| ------------------ | ---------------------------------------------------- |
+| **业务含义** | 游戏的投注金额限制，用于按用户投注能力过滤           |
+| **数据来源** | **业务表无此字段**，需从订单数据统计或手动配置 |
+| **更新频率** | T+1（投注范围较稳定）                                |
+
+**统计计算方案：**
+
+```sql
+-- 从历史订单统计游戏的实际投注范围
+-- 使用 P5 和 P95 作为有效投注范围
+SELECT
+    odg.s_game_id AS game_id,
+    PERCENTILE_CONT(0.05) WITHIN GROUP (ORDER BY oog.n_order_money) AS min_bet,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY oog.n_order_money) AS max_bet
+FROM overseas_order_detail_game odg
+JOIN overseas_order_game oog ON odg.n_order_id = oog.n_id
+WHERE oog.n_status = 1
+  AND oog.n_pay_status = 1
+  AND oog.d_create_time >= UNIX_TIMESTAMP(DATE_SUB(CURDATE(), INTERVAL 30 DAY)) * 1000
+GROUP BY odg.s_game_id
+```
+
+**默认值处理：**
+
+| 情况               | min_bet | max_bet | 说明                 |
+| ------------------ | ------- | ------- | -------------------- |
+| 无订单数据         | 0.10    | 1000.00 | 使用平台默认范围     |
+| 统计样本不足(<100) | 0.10    | 1000.00 | 样本太少，使用默认值 |
+| 正常统计           | P5      | P95     | 使用统计分位数       |
+
+---
+
+##### 二、游戏状态属性
+
+###### 7. status（游戏状态）
+
+| 属性               | 说明                              |
+| ------------------ | --------------------------------- |
+| **业务含义** | 游戏当前状态，用于过滤不可用游戏  |
+| **数据来源** | `overseas_casino_game.n_status` |
+| **取值范围** | 0-下线, 1-上线, 2-维护            |
+| **更新频率** | 实时同步（关键业务状态）          |
+
+**映射逻辑：**
+
+```sql
+SELECT
+    s_game_id AS game_id,
+    CASE n_status
+        WHEN 1 THEN 1  -- 启用 → 上线
+        WHEN 0 THEN 0  -- 禁用 → 下线
+        ELSE 2         -- 其他状态 → 维护
+    END AS status
+FROM overseas_casino_game
+```
+
+**同步策略：**
+
+- 建议实时同步
+- 状态变更直接影响推荐结果，需确保秒级同步
+
+---
+
+###### 8. is_new（是否新游戏）
+
+| 属性               | 说明                                     |
+| ------------------ | ---------------------------------------- |
+| **业务含义** | 标识新上架游戏，用于新游戏召回和曝光控制 |
+| **数据来源** | `overseas_casino_game.n_category`      |
+| **取值范围** | 0-否, 1-是                               |
+| **更新频率** | T+1                                      |
+
+**计算逻辑：**
+
+```sql
+-- 基于 n_category 判断
+-- n_category: 1=新游戏, 2=热门, 3=新且热门, 4=其他
+SELECT
+    s_game_id AS game_id,
+    CASE
+        WHEN n_category IN (1, 3) THEN 1  -- 新游戏 或 新且热门
+        ELSE 0
+    END AS is_new
+FROM overseas_casino_game
+WHERE n_status = 1
+```
+
+**备选方案（基于上线时间）：**
+
+```sql
+-- 如果有上线时间字段，可用时间计算
+SELECT
+    s_game_id AS game_id,
+    CASE
+        WHEN DATEDIFF(CURDATE(), FROM_UNIXTIME(d_create_time/1000)) <= 7 THEN 1
+        ELSE 0
+    END AS is_new
+FROM overseas_casino_game
+WHERE n_status = 1
+```
+
+---
+
+###### 9. is_featured（是否运营推荐）
+
+| 属性               | 说明                                   |
+| ------------------ | -------------------------------------- |
+| **业务含义** | 运营人工标记的推荐游戏，用于运营位召回 |
+| **数据来源** | `overseas_casino_game.n_category`    |
+| **取值范围** | 0-否, 1-是                             |
+| **更新频率** | T+1（或运营后台变更时实时同步）        |
+
+**计算逻辑：**
+
+```sql
+-- 基于 n_category 判断
+-- n_category: 1=新游戏, 2=热门, 3=新且热门, 4=其他
+SELECT
+    s_game_id AS game_id,
+    CASE
+        WHEN n_category IN (2, 3) THEN 1  -- 热门 或 新且热门
+        ELSE 0
+    END AS is_featured
+FROM overseas_casino_game
+WHERE n_status = 1
+```
+
+---
+
+###### 10. is_jackpot（是否有累积奖池）
+
+| 属性               | 说明                                             |
+| ------------------ | ------------------------------------------------ |
+| **业务含义** | 标识有累积奖池的游戏，适合追求大奖的用户         |
+| **数据来源** | `overseas_casino_game.s_features` 或单独配置表 |
+| **取值范围** | 0-否, 1-是                                       |
+| **更新频率** | T+1                                              |
+
+**计算逻辑：**
+
+```sql
+-- 从 s_features 字段解析
+SELECT
+    s_game_id AS game_id,
+    CASE
+        WHEN LOWER(s_features) LIKE '%jackpot%' THEN 1
+        WHEN LOWER(s_features) LIKE '%progressive%' THEN 1
+        ELSE 0
+    END AS is_jackpot
+FROM overseas_casino_game
+WHERE n_status = 1
+```
+
+---
+
+###### 11. launch_days（上线天数）
+
+| 属性               | 说明                                   |
+| ------------------ | -------------------------------------- |
+| **业务含义** | 游戏上线时长，用于生命周期判断         |
+| **数据来源** | `overseas_casino_game.d_create_time` |
+| **更新频率** | T+1（每日+1）                          |
+
+**计算逻辑：**
+
+```sql
+SELECT
+    s_game_id AS game_id,
+    DATEDIFF(CURDATE(), DATE(FROM_UNIXTIME(d_create_time / 1000))) AS launch_days
+FROM overseas_casino_game
+WHERE n_status = 1
+  AND d_create_time IS NOT NULL
+```
+
+**边界情况：**
+
+| 情况                       | 处理方式            |
+| -------------------------- | ------------------- |
+| `d_create_time` 为 NULL  | `launch_days = 0` |
+| 创建时间在未来（数据异常） | 记录日志，置为 0    |
+
+---
+
+###### 12. lifecycle_stage（游戏生命周期阶段）
+
+| 属性               | 说明                                           |
+| ------------------ | ---------------------------------------------- |
+| **业务含义** | 游戏当前所处生命周期，影响曝光策略和权重计算   |
+| **数据来源** | 综合 `launch_days`、热度趋势、活跃玩家数计算 |
+| **取值范围** | 0-new, 1-growth, 2-mature, 3-decline           |
+| **更新频率** | T+1                                            |
+
+**计算逻辑：**
+
+```python
+def calculate_game_lifecycle(game_id, launch_days, play_count_7d, play_count_30d, unique_players_7d):
+    """
+    游戏生命周期判定规则：
+
+    0-new(新游戏): 上线<=14天
+    1-growth(成长期): 上线14-60天 且 热度上升
+    2-mature(成熟期): 上线>60天 且 热度稳定
+    3-decline(衰退期): 热度持续下降（7天热度 < 30天热度/4）
+    """
+    # 热度趋势判断
+    avg_daily_play_30d = play_count_30d / 30 if play_count_30d else 0
+    avg_daily_play_7d = play_count_7d / 7 if play_count_7d else 0
+
+    # 热度上升: 近7天日均 > 近30天日均 * 1.1
+    is_growing = avg_daily_play_7d > avg_daily_play_30d * 1.1
+    # 热度下降: 近7天日均 < 近30天日均 * 0.5
+    is_declining = avg_daily_play_7d < avg_daily_play_30d * 0.5
+
+    # 生命周期判定（按优先级）
+    if launch_days <= 14:
+        return 0  # new
+    elif is_declining and launch_days > 30:
+        return 3  # decline
+    elif launch_days <= 60 and is_growing:
+        return 1  # growth
+    else:
+        return 2  # mature
+```
+
+**SQL实现：**
+
+```sql
+SELECT
+    game_id,
+    CASE
+        WHEN launch_days <= 14 THEN 0  -- new
+        WHEN launch_days > 30
+             AND play_count_7d / 7 < play_count_30d / 30 * 0.5 THEN 3  -- decline
+        WHEN launch_days <= 60
+             AND play_count_7d / 7 > play_count_30d / 30 * 1.1 THEN 1  -- growth
+        ELSE 2  -- mature
+    END AS lifecycle_stage
+FROM (
+    SELECT
+        game_id,
+        launch_days,
+        play_count_7d,
+        -- 需要额外计算30天游戏次数
+        (SELECT COUNT(*) FROM user_behaviors ub
+         WHERE ub.game_id = agf.game_id
+           AND ub.behavior_type = 'play'
+           AND ub.behavior_time >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)) AS play_count_30d
+    FROM algo_game_features agf
+) t
+```
+
+**生命周期与推荐策略关系：**
+
+| 生命周期 | 曝光策略                          | 权重调整     |
+| -------- | --------------------------------- | ------------ |
+| new      | 增加曝光机会（Thompson Sampling） | boost × 1.2 |
+| growth   | 正常推荐，保持曝光                | boost × 1.1 |
+| mature   | 稳定推荐                          | boost × 1.0 |
+| decline  | 减少曝光，给新游戏让位            | boost × 0.8 |
+
+---
+
+##### 三、多值属性编码
+
+###### 13. themes_bitmap（主题标签位图）
+
+| 属性               | 说明                                             |
+| ------------------ | ------------------------------------------------ |
+| **业务含义** | 游戏的主题标签集合（如：古埃及、神话、水果等）   |
+| **数据来源** | `overseas_casino_game.s_features` 或运营配置表 |
+| **编码方式** | 位图（Bitmap），每个位对应一个主题               |
+| **更新频率** | T+1                                              |
+
+**主题编码映射表：**
+
+```sql
+-- 主题编码表（位置从0开始）
+CREATE TABLE dim_theme_encoding (
+    theme_id SMALLINT UNSIGNED PRIMARY KEY COMMENT '主题ID',
+    bit_position TINYINT UNSIGNED COMMENT '位图位置 0-63',
+    theme_name VARCHAR(32) COMMENT '主题名称',
+    theme_keywords VARCHAR(256) COMMENT '匹配关键词（逗号分隔）'
+);
+
+-- 示例数据
+INSERT INTO dim_theme_encoding VALUES
+(1, 0, 'egyptian', 'egypt,pharaoh,cleopatra,pyramid'),
+(2, 1, 'mythology', 'zeus,olympus,god,goddess,thor'),
+(3, 2, 'fruit', 'fruit,cherry,apple,orange,watermelon'),
+(4, 3, 'asian', 'dragon,fortune,lucky,chinese,oriental'),
+(5, 4, 'adventure', 'adventure,treasure,explorer,quest'),
+(6, 5, 'fantasy', 'magic,wizard,fairy,fantasy,enchanted'),
+(7, 6, 'animal', 'animal,safari,wildlife,jungle'),
+(8, 7, 'classic', 'classic,retro,777,bar'),
+(9, 8, 'irish', 'irish,leprechaun,rainbow,clover'),
+(10, 9, 'horror', 'horror,vampire,zombie,halloween'),
+-- ... 最多64个主题
+```
+
+**位图编码逻辑：**
+
+```python
+def encode_themes_bitmap(game_name, game_features, theme_encodings):
+    """
+    主题位图编码：
+    1. 将游戏名称和特性文本与主题关键词匹配
+    2. 匹配成功则设置对应位为1
+    3. 返回64位整数
+
+    示例：
+    - 游戏名含 "Zeus" → 匹配 mythology → 设置 bit 1
+    - 位图: 0000...0010 → themes_bitmap = 2
+    """
+    bitmap = 0
+    combined_text = f"{game_name} {game_features}".lower()
+
+    for encoding in theme_encodings:
+        keywords = encoding['theme_keywords'].lower().split(',')
+        for keyword in keywords:
+            if keyword.strip() in combined_text:
+                # 设置对应位为1
+                bitmap |= (1 << encoding['bit_position'])
+                break  # 匹配一个关键词即可
+
+    return bitmap
+
+# 示例
+# game_name = "Gates of Olympus"
+# game_features = "mythology, free spins, multiplier"
+# 匹配: mythology (bit 1) → bitmap = 2
+```
+
+**SQL批量计算：**
+
+```sql
+-- 使用位运算构建位图
+SELECT
+    ocg.s_game_id AS game_id,
+    SUM(
+        CASE
+            WHEN LOWER(CONCAT(ocg.s_game_name, ' ', COALESCE(ocg.s_features, '')))
+                 REGEXP dte.theme_keywords_regex THEN POW(2, dte.bit_position)
+            ELSE 0
+        END
+    ) AS themes_bitmap
+FROM overseas_casino_game ocg
+CROSS JOIN dim_theme_encoding dte
+WHERE ocg.n_status = 1
+GROUP BY ocg.s_game_id
+```
+
+---
+
+###### 14. features_bitmap（特性标签位图）
+
+| 属性               | 说明                                                      |
+| ------------------ | --------------------------------------------------------- |
+| **业务含义** | 游戏的功能特性集合（如：Megaways、免费旋转、乘数等）      |
+| **数据来源** | `overseas_casino_game.s_features` + `n_frb_available` |
+| **编码方式** | 位图（Bitmap），每个位对应一个特性                        |
+| **更新频率** | T+1                                                       |
+
+**特性编码映射表：**
+
+```sql
+CREATE TABLE dim_feature_encoding (
+    feature_id SMALLINT UNSIGNED PRIMARY KEY,
+    bit_position TINYINT UNSIGNED COMMENT '位图位置 0-63',
+    feature_name VARCHAR(32),
+    feature_keywords VARCHAR(256)
+);
+
+INSERT INTO dim_feature_encoding VALUES
+(1, 0, 'megaways', 'megaways'),
+(2, 1, 'free_spins', 'free spin,freespin,free round'),
+(3, 2, 'multiplier', 'multiplier,multiply'),
+(4, 3, 'wild', 'wild,expanding wild,sticky wild'),
+(5, 4, 'scatter', 'scatter'),
+(6, 5, 'bonus_game', 'bonus game,bonus round,mini game'),
+(7, 6, 'jackpot', 'jackpot,progressive'),
+(8, 7, 'buy_feature', 'buy feature,bonus buy'),
+(9, 8, 'cascade', 'cascade,tumble,avalanche'),
+(10, 9, 'hold_spin', 'hold,respin'),
+(11, 10, 'cluster_pay', 'cluster,cluster pay');
+```
+
+**计算逻辑（含特殊字段处理）：**
+
+```python
+def encode_features_bitmap(game_id, s_features, n_frb_available, feature_encodings):
+    """
+    特性位图编码：
+    1. 从 s_features 文本匹配特性关键词
+    2. 特殊处理 n_frb_available 字段（免费旋转）
+
+    n_frb_available = 1 → 强制设置 free_spins 位
+    """
+    bitmap = 0
+    features_text = (s_features or '').lower()
+
+    # 遍历所有特性编码
+    for encoding in feature_encodings:
+        keywords = encoding['feature_keywords'].lower().split(',')
+        for keyword in keywords:
+            if keyword.strip() in features_text:
+                bitmap |= (1 << encoding['bit_position'])
+                break
+
+    # 特殊处理：n_frb_available 字段
+    if n_frb_available == 1:
+        # free_spins 在 bit_position = 1
+        bitmap |= (1 << 1)
+
+    return bitmap
+```
+
+---
+
+###### 15. theme_1 / theme_2 / theme_3（Top3主题ID）
+
+| 属性               | 说明                                |
+| ------------------ | ----------------------------------- |
+| **业务含义** | 游戏的主要主题，用于快速主题匹配    |
+| **数据来源** | 从 `themes_bitmap` 解析或人工标注 |
+| **更新频率** | T+1                                 |
+
+**计算逻辑：**
+
+```python
+def extract_top3_themes(themes_bitmap, theme_priority):
+    """
+    从位图中提取Top3主题ID
+
+    theme_priority: 主题优先级列表（按业务重要性排序）
+    """
+    themes = []
+
+    for theme in theme_priority:
+        bit_position = theme['bit_position']
+        if themes_bitmap & (1 << bit_position):
+            themes.append(theme['theme_id'])
+            if len(themes) >= 3:
+                break
+
+    # 不足3个用0填充
+    while len(themes) < 3:
+        themes.append(0)
+
+    return themes[0], themes[1], themes[2]
+```
+
+---
+
+##### 四、热度统计特征（小时级更新）
+
+###### 16. hot_score_1h / hot_score_24h / hot_score_7d（热度分数）
+
+| 属性               | 说明                                                          |
+| ------------------ | ------------------------------------------------------------- |
+| **业务含义** | 归一化的热度分数，用于热门召回排序                            |
+| **数据来源** | `overseas_order_game` + `overseas_order_detail_game`      |
+| **取值范围** | [0, 1]，归一化分数                                            |
+| **更新频率** | 小时级（hot_score_1h）/ 小时级（hot_score_24h, hot_score_7d） |
+
+**归一化公式：**
+
+```
+hot_score = log(1 + play_count) / log(1 + max_play_count)
+
+其中：
+- play_count: 该游戏在时间窗口内的游戏次数
+- max_play_count: 所有游戏在同一时间窗口内的最大游戏次数
+```
+
+**计算SQL（1小时热度）：**
+
+```sql
+-- Step 1: 计算各游戏1小时游戏次数
+WITH hourly_play AS (
+    SELECT
+        odg.s_game_id AS game_id,
+        COUNT(*) AS play_count
+    FROM overseas_order_game oog
+    JOIN overseas_order_detail_game odg ON oog.n_id = odg.n_order_id
+    WHERE oog.n_status = 1
+      AND oog.n_pay_status = 1
+      AND oog.d_create_time >= (UNIX_TIMESTAMP(NOW()) - 3600) * 1000  -- 1小时内
+    GROUP BY odg.s_game_id
+),
+max_count AS (
+    SELECT MAX(play_count) AS max_play FROM hourly_play
+)
+-- Step 2: 归一化计算
+SELECT
+    hp.game_id,
+    hp.play_count AS play_count_1h,
+    ROUND(LOG(1 + hp.play_count) / LOG(1 + mc.max_play), 5) AS hot_score_1h
+FROM hourly_play hp
+CROSS JOIN max_count mc
+```
+
+**24小时和7天热度计算：**
+
+```sql
+-- 24小时热度
+WITH daily_play AS (
+    SELECT
+        odg.s_game_id AS game_id,
+        COUNT(*) AS play_count
+    FROM overseas_order_game oog
+    JOIN overseas_order_detail_game odg ON oog.n_id = odg.n_order_id
+    WHERE oog.n_status = 1
+      AND oog.n_pay_status = 1
+      AND oog.d_create_time >= (UNIX_TIMESTAMP(NOW()) - 86400) * 1000  -- 24小时内
+    GROUP BY odg.s_game_id
+),
+max_count AS (
+    SELECT MAX(play_count) AS max_play FROM daily_play
+)
+SELECT
+    dp.game_id,
+    dp.play_count AS play_count_24h,
+    ROUND(LOG(1 + dp.play_count) / LOG(1 + mc.max_play), 5) AS hot_score_24h
+FROM daily_play dp
+CROSS JOIN max_count mc
+
+-- 7天热度（类似逻辑，时间窗口改为 7 * 86400 秒）
+```
+
+**热度分数特点：**
+
+| 分数范围  | 含义               | 游戏数占比(估) |
+| --------- | ------------------ | -------------- |
+| 0.8 - 1.0 | 超热门（头部游戏） | ~1%            |
+| 0.5 - 0.8 | 热门               | ~10%           |
+| 0.2 - 0.5 | 中等热度           | ~30%           |
+| 0.0 - 0.2 | 低热度/长尾        | ~59%           |
+
+**边界情况：**
+
+| 情况              | 处理方式                     |
+| ----------------- | ---------------------------- |
+| 无游戏次数        | `hot_score = 0`            |
+| 所有游戏次数都为0 | `hot_score = 0`（避免除0） |
+| 新游戏            | 可能热度偏低，需结合探索策略 |
+
+---
+
+###### 17. play_count_1h / play_count_24h / play_count_7d（原始游戏次数）
+
+| 属性               | 说明                                 |
+| ------------------ | ------------------------------------ |
+| **业务含义** | 原始游戏次数，用于召回时的绝对值排序 |
+| **数据来源** | `overseas_order_game` 订单统计     |
+| **更新频率** | 小时级                               |
+
+**计算逻辑（见上文热度分数计算的中间结果）**
+
+---
+
+###### 18. unique_players_7d（7天独立玩家数）
+
+| 属性               | 说明                                       |
+| ------------------ | ------------------------------------------ |
+| **业务含义** | 衡量游戏的用户覆盖广度                     |
+| **数据来源** | `overseas_order_game.n_user_id` 去重统计 |
+| **更新频率** | T+1（或小时级）                            |
+
+**计算SQL：**
+
+```sql
+SELECT
+    odg.s_game_id AS game_id,
+    COUNT(DISTINCT oog.n_user_id) AS unique_players_7d
+FROM overseas_order_game oog
+JOIN overseas_order_detail_game odg ON oog.n_id = odg.n_order_id
+WHERE oog.n_status = 1
+  AND oog.n_pay_status = 1
+  AND oog.n_user_id > 1100000  -- 排除测试用户
+  AND oog.d_create_time >= (UNIX_TIMESTAMP(CURDATE()) - 7 * 86400) * 1000
+GROUP BY odg.s_game_id
+```
+
+---
+
+##### 五、效果指标（T+1更新）
+
+###### 19. ctr_7d（7天点击率）
+
+| 属性               | 说明                                      |
+| ------------------ | ----------------------------------------- |
+| **业务含义** | 游戏被曝光后的点击概率，反映吸引力        |
+| **数据来源** | `algo_recommendation_log`（推荐日志表） |
+| **计算公式** | `CTR = 点击数 / 曝光数`                 |
+| **更新频率** | T+1                                       |
+
+**计算SQL：**
+
+```sql
+-- 依赖推荐日志表的曝光和点击统计
+WITH game_impressions AS (
+    SELECT
+        jt.game_id,
+        COUNT(*) AS impressions,
+        SUM(CASE WHEN jt.game_id IN (
+            SELECT JSON_UNQUOTE(JSON_EXTRACT(arl.clicked_games, CONCAT('$[', numbers.n, ']')))
+            FROM (SELECT 0 n UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4) numbers
+            WHERE JSON_EXTRACT(arl.clicked_games, CONCAT('$[', numbers.n, ']')) IS NOT NULL
+        ) THEN 1 ELSE 0 END) AS clicks
+    FROM algo_recommendation_log arl
+    CROSS JOIN JSON_TABLE(
+        arl.recommended_games,
+        '$[*]' COLUMNS(game_id VARCHAR(64) PATH '$.game_id')
+    ) AS jt
+    WHERE arl.log_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+    GROUP BY jt.game_id
+)
+SELECT
+    game_id,
+    ROUND(clicks / NULLIF(impressions, 0), 4) AS ctr_7d
+FROM game_impressions
+```
+
+**贝叶斯平滑处理：**
+
+```python
+def calculate_ctr_with_smoothing(clicks, impressions, global_ctr=0.05, min_impressions=100):
+    """
+    CTR贝叶斯平滑：
+    当曝光数不足时，使用全局CTR作为先验进行平滑
+
+    公式: smoothed_ctr = (clicks + global_ctr * weight) / (impressions + weight)
+    weight = min_impressions（等效增加100次曝光）
+    """
+    if impressions < min_impressions:
+        weight = min_impressions
+        smoothed_ctr = (clicks + global_ctr * weight) / (impressions + weight)
+        return round(smoothed_ctr, 4)
+    else:
+        return round(clicks / impressions, 4) if impressions > 0 else 0.0
+```
+
+**边界情况：**
+
+| 情况          | 处理方式              |
+| ------------- | --------------------- |
+| 无曝光数据    | 使用全局CTR（约0.05） |
+| 曝光数 < 100  | 贝叶斯平滑            |
+| 曝光数 >= 100 | 直接计算实际CTR       |
+
+---
+
+###### 20. cvr_7d（7天转化率）
+
+| 属性               | 说明                                   |
+| ------------------ | -------------------------------------- |
+| **业务含义** | 点击后开始游戏的概率，反映游戏留存能力 |
+| **数据来源** | `algo_recommendation_log`            |
+| **计算公式** | `CVR = 游戏次数 / 点击数`            |
+| **更新频率** | T+1                                    |
+
+**计算逻辑：**
+
+```sql
+-- 从推荐日志统计点击→游戏转化
+WITH game_clicks AS (
+    SELECT
+        jt.game_id,
+        COUNT(*) AS clicks
+    FROM algo_recommendation_log arl
+    CROSS JOIN JSON_TABLE(
+        arl.clicked_games,
+        '$[*]' COLUMNS(game_id VARCHAR(64) PATH '$')
+    ) AS jt
+    WHERE arl.log_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+    GROUP BY jt.game_id
+),
+game_plays AS (
+    SELECT
+        jt.game_id,
+        COUNT(*) AS plays
+    FROM algo_recommendation_log arl
+    CROSS JOIN JSON_TABLE(
+        arl.played_games,
+        '$[*]' COLUMNS(game_id VARCHAR(64) PATH '$')
+    ) AS jt
+    WHERE arl.log_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+    GROUP BY jt.game_id
+)
+SELECT
+    gc.game_id,
+    ROUND(COALESCE(gp.plays, 0) / NULLIF(gc.clicks, 0), 4) AS cvr_7d
+FROM game_clicks gc
+LEFT JOIN game_plays gp ON gc.game_id = gp.game_id
+```
+
+**贝叶斯平滑**：同CTR处理方式
+
+---
+
+###### 21. avg_session_duration（平均游戏时长）
+
+| 属性               | 说明                                 |
+| ------------------ | ------------------------------------ |
+| **业务含义** | 玩家平均每次游戏的时长，反映游戏粘性 |
+| **数据来源** | `user_behaviors` 或订单时间差估算  |
+| **更新频率** | T+1                                  |
+
+**计算方案（基于订单时间差估算）：**
+
+```sql
+-- 如果没有明确的时长字段，使用同一用户连续订单的时间差估算
+WITH ordered_plays AS (
+    SELECT
+        odg.s_game_id AS game_id,
+        oog.n_user_id,
+        oog.d_buy_time,
+        LEAD(oog.d_buy_time) OVER (
+            PARTITION BY oog.n_user_id, odg.s_game_id
+            ORDER BY oog.d_buy_time
+        ) AS next_buy_time
+    FROM overseas_order_game oog
+    JOIN overseas_order_detail_game odg ON oog.n_id = odg.n_order_id
+    WHERE oog.n_status = 1
+      AND oog.d_create_time >= (UNIX_TIMESTAMP(CURDATE()) - 7 * 86400) * 1000
+)
+SELECT
+    game_id,
+    ROUND(AVG(
+        CASE
+            WHEN (next_buy_time - d_buy_time) / 1000 BETWEEN 10 AND 3600
+            THEN (next_buy_time - d_buy_time) / 1000
+            ELSE NULL
+        END
+    )) AS avg_session_duration
+FROM ordered_plays
+GROUP BY game_id
+```
+
+**边界情况：**
+
+- 时间差 < 10秒：视为同一投注，不计入
+- 时间差 > 3600秒：视为新会话，不计入
+
+---
+
+###### 22. avg_bet_amount（平均单次投注）
+
+| 属性               | 说明                                  |
+| ------------------ | ------------------------------------- |
+| **业务含义** | 玩家在该游戏的平均投注金额            |
+| **数据来源** | `overseas_order_game.n_order_money` |
+| **更新频率** | T+1                                   |
+
+**计算SQL：**
+
+```sql
+SELECT
+    odg.s_game_id AS game_id,
+    ROUND(AVG(oog.n_order_money), 2) AS avg_bet_amount
+FROM overseas_order_game oog
+JOIN overseas_order_detail_game odg ON oog.n_id = odg.n_order_id
+WHERE oog.n_status = 1
+  AND oog.n_pay_status = 1
+  AND oog.n_order_money > 0
+  AND oog.d_create_time >= (UNIX_TIMESTAMP(CURDATE()) - 7 * 86400) * 1000
+GROUP BY odg.s_game_id
+```
+
+---
+
+###### 23. avg_rating / favorite_count（评分与收藏）
+
+| 属性               | 说明                               |
+| ------------------ | ---------------------------------- |
+| **业务含义** | 用户对游戏的主观评价               |
+| **数据来源** | **⚠️ 需要新增评分/收藏表** |
+| **更新频率** | T+1                                |
+
+**临时处理方案：**
+
+```sql
+-- 暂无评分收藏表，使用默认值
+UPDATE algo_game_features
+SET
+    avg_rating = 0.00,
+    favorite_count = 0
+WHERE avg_rating IS NULL
+```
+
+---
+
+##### 六、运营权重
+
+###### 24. boost_weight（运营加权）
+
+| 属性               | 说明                                           |
+| ------------------ | ---------------------------------------------- |
+| **业务含义** | 运营人工设置的权重，用于调整游戏曝光优先级     |
+| **数据来源** | 运营后台配置或 `overseas_casino_game.n_sort` |
+| **取值范围** | [0.50, 2.00]，1.00为基准                       |
+| **更新频率** | 运营变更时实时同步                             |
+
+**权重策略说明：**
+
+| 权重值 | 适用场景                       |
+| ------ | ------------------------------ |
+| 2.00   | 重点推广游戏（新上线、合作款） |
+| 1.50   | 运营推荐游戏                   |
+| 1.00   | 普通游戏（默认）               |
+| 0.75   | 低优先级游戏                   |
+| 0.50   | 降权游戏（待下线、低质量）     |
+
+**计算逻辑（基于n_sort）：**
+
+```sql
+-- 将 n_sort 映射到 boost_weight
+-- 假设 n_sort 越大优先级越高，范围 1-100
+SELECT
+    s_game_id AS game_id,
+    CASE
+        WHEN n_sort >= 90 THEN 2.00
+        WHEN n_sort >= 70 THEN 1.50
+        WHEN n_sort >= 30 THEN 1.00
+        WHEN n_sort >= 10 THEN 0.75
+        ELSE 0.50
+    END AS boost_weight
+FROM overseas_casino_game
+WHERE n_status = 1
+```
+
+**或从运营配置表读取：**
+
+```sql
+-- 如果有独立的运营配置表
+SELECT
+    agf.game_id,
+    COALESCE(obc.boost_weight, 1.00) AS boost_weight
+FROM algo_game_features agf
+LEFT JOIN ops_boost_config obc ON agf.game_id = obc.game_id
+```
+
+---
+
+##### 七、更新策略汇总
+
+###### 7.1 字段更新频率分类
+
+| 更新频率         | 字段列表                                                                                                                                                                                                                                                                                                                                         |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **小时级** | `hot_score_1h`, `hot_score_24h`, `hot_score_7d`, `play_count_1h`, `play_count_24h`, `play_count_7d`                                                                                                                                                                                                                                  |
+| **T+1**    | `category_id`, `provider_id`, `rtp`, `min_bet`, `max_bet`, `is_new`, `is_featured`, `is_jackpot`, `launch_days`, `lifecycle_stage`, `themes_bitmap`, `features_bitmap`, `theme_1/2/3`, `unique_players_7d`, `ctr_7d`, `cvr_7d`, `avg_session_duration`, `avg_bet_amount`, `avg_rating`, `favorite_count` |
+| **实时**   | `status`, `boost_weight`                                                                                                                                                                                                                                                                                                                     |
+
+###### 7.2 ETL任务设计
+
+```python
+# 小时级任务（每小时执行）
+HOURLY_ETL_FIELDS = [
+    'hot_score_1h', 'hot_score_24h', 'hot_score_7d',
+    'play_count_1h', 'play_count_24h', 'play_count_7d'
+]
+
+# T+1任务（每日凌晨执行）
+DAILY_ETL_FIELDS = [
+    # 基础属性
+    'category_id', 'provider_id', 'rtp', 'min_bet', 'max_bet',
+    # 状态属性
+    'is_new', 'is_featured', 'is_jackpot', 'launch_days', 'lifecycle_stage',
+    # 多值属性
+    'themes_bitmap', 'features_bitmap', 'theme_1', 'theme_2', 'theme_3',
+    # 效果指标
+    'unique_players_7d', 'ctr_7d', 'cvr_7d',
+    'avg_session_duration', 'avg_bet_amount',
+    'avg_rating', 'favorite_count'
+]
+
+# 实时同步任务（CDC）
+REALTIME_SYNC_FIELDS = ['status', 'boost_weight']
+```
+
+###### 7.3 数据质量检查SQL
+
+```sql
+-- 游戏特征完整性检查
+SELECT
+    COUNT(*) AS total_games,
+    SUM(CASE WHEN category_id = 0 THEN 1 ELSE 0 END) AS unknown_category,
+    SUM(CASE WHEN provider_id = 0 THEN 1 ELSE 0 END) AS unknown_provider,
+    SUM(CASE WHEN rtp IS NULL THEN 1 ELSE 0 END) AS null_rtp,
+    SUM(CASE WHEN hot_score_7d = 0 THEN 1 ELSE 0 END) AS zero_hot_score,
+    SUM(CASE WHEN status NOT IN (0, 1, 2) THEN 1 ELSE 0 END) AS invalid_status
+FROM algo_game_features;
+
+-- 热度分数分布检查
+SELECT
+    CASE
+        WHEN hot_score_7d >= 0.8 THEN 'top_hot'
+        WHEN hot_score_7d >= 0.5 THEN 'hot'
+        WHEN hot_score_7d >= 0.2 THEN 'medium'
+        ELSE 'low'
+    END AS hot_tier,
+    COUNT(*) AS game_count,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS percentage
+FROM algo_game_features
+WHERE status = 1
+GROUP BY 1
+ORDER BY MIN(hot_score_7d) DESC;
+
+-- 生命周期分布检查
+SELECT
+    lifecycle_stage,
+    COUNT(*) AS game_count
+FROM algo_game_features
+WHERE status = 1
+GROUP BY lifecycle_stage
+ORDER BY lifecycle_stage;
+```
+
+---
+
 ### 2.3 游戏相似度表 (algo_game_similarity)
 
 **用途**：存储预计算的游戏相似度矩阵，供 Item-CF 召回使用。
