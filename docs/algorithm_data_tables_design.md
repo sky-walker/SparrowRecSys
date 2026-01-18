@@ -99,9 +99,9 @@ CREATE TABLE algo_user_features (
     pref_provider_2 SMALLINT UNSIGNED DEFAULT 0 COMMENT '第2偏好提供商ID',
     pref_provider_3 SMALLINT UNSIGNED DEFAULT 0 COMMENT '第3偏好提供商ID',
   
-    -- 风险偏好 (基于波动性选择计算)
-    risk_preference TINYINT UNSIGNED DEFAULT 1 COMMENT '风险偏好: 0-low 1-medium 2-high',
-    risk_score DECIMAL(4,3) DEFAULT 0.500 COMMENT '风险偏好分数 0-1',
+    -- 风险偏好 (基于RTP选择 + 投注行为综合计算)
+    risk_preference TINYINT UNSIGNED DEFAULT 1 COMMENT '风险偏好: 0-low(保守) 1-medium 2-high(激进)',
+    risk_score DECIMAL(4,3) DEFAULT 0.500 COMMENT '风险偏好分数 0-1 (0=保守,1=激进)',
   
     -- ============ 用户行为统计特征 ============
     -- 总量统计
@@ -417,88 +417,221 @@ FROM (
 
 ###### 7. risk_preference / risk_score（风险偏好）
 
-| 属性               | 说明                                            |
-| ------------------ | ----------------------------------------------- |
-| **业务含义** | 用户的风险承受偏好，基于游戏波动性选择推断      |
-| **数据来源** | `user_behaviors` + `games.volatility_score` |
-| **取值范围** | risk_preference: 0-2, risk_score: [0, 1]        |
+| 属性               | 说明                                                                   |
+| ------------------ | ---------------------------------------------------------------------- |
+| **业务含义** | 用户的风险承受偏好，反映用户是追求稳定小收益还是愿意承担风险博取大收益 |
+| **数据来源** | `user_behaviors` + `overseas_casino_game.n_hit_rate`（RTP）        |
+| **取值范围** | risk_preference: 0-2, risk_score: [0, 1]                               |
+| **语义映射** | 0=保守(偏好高RTP), 1=中等, 2=激进(偏好低RTP)                           |
 
-**计算公式：**
+> **⚠️ 数据限制说明**
+>
+> 理想情况下，风险偏好应基于游戏的**波动性（Volatility）**计算，但当前业务数据库 `overseas_casino_game` 表中**没有波动性字段**，只有 `n_hit_rate`（RTP）字段。
+>
+> **RTP vs 波动性的区别：**
+>
+> - **RTP（Return to Player）**：长期理论返还率，如96%表示每投注100元理论上返还96元
+> - **波动性（Volatility）**：收益的波动程度，高波动=稀少大奖，低波动=频繁小奖
+>
+> 两者是**独立维度**，高RTP游戏可以是高波动或低波动。但在缺少波动性数据时，我们采用**多维度综合评估**来近似用户风险偏好。
+
+**计算公式（基于RTP + 投注行为综合评估）：**
 
 ```python
 def calculate_risk_preference(user_id, T, decay_factor=0.95):
     """
-    风险偏好计算：
-    1. 获取用户玩过的游戏的波动性分数 (1-5)
-    2. 计算加权平均波动性
-    3. 归一化到 [0, 1]
-    4. 离散化为 low/medium/high
+    风险偏好计算 - 基于RTP偏好 + 投注行为模式综合评估
+
+    由于缺少波动性数据，采用多维度信号：
+    1. RTP偏好：偏好低RTP游戏 → 可能更愿意冒险
+    2. 投注集中度：集中投注少数游戏 vs 分散投注
+    3. 单次投注金额：大额投注 → 更高风险承受
+    4. 游戏类型：Crash类游戏玩家通常更激进
+
+    最终分数 = 0.4 * rtp_score + 0.2 * concentration_score + 0.2 * bet_score + 0.2 * gametype_score
     """
 
-    # 获取用户play行为对应的游戏波动性
-    plays = query("""
+    # ============ 维度1: RTP偏好 (权重40%) ============
+    rtp_data = query("""
         SELECT
-            g.volatility_score,
+            g.n_hit_rate AS rtp,
+            g.s_data_type AS game_type,
             ub.duration,
             DATEDIFF(:T, DATE(ub.behavior_time)) AS days_ago
         FROM user_behaviors ub
-        JOIN games g ON ub.game_id = g.game_id
+        JOIN overseas_casino_game g ON ub.game_id = g.s_game_id
         WHERE ub.user_id = :user_id
           AND ub.behavior_type = 'play'
           AND ub.behavior_time >= DATE_SUB(:T, INTERVAL 29 DAY)
+          AND g.n_hit_rate IS NOT NULL
     """, user_id=user_id, T=T)
 
-    if not plays:
-        # 无游戏记录，返回默认中等风险
+    if not rtp_data:
+        # 无有效数据，返回默认中等
         return {'risk_preference': 1, 'risk_score': 0.500}
 
-    weighted_sum = 0
+    # 计算加权平均RTP
+    weighted_rtp_sum = 0
     weight_total = 0
+    game_type_counts = {'RNG': 0, 'LC': 0, 'VSB': 0, 'CRASH': 0}
 
-    for row in plays:
-        volatility = row['volatility_score']  # 1-5
-        duration = row['duration'] or 60  # 默认1分钟
+    for row in rtp_data:
+        rtp = float(row['rtp'])
+        duration = row['duration'] or 60
         days_ago = row['days_ago']
+        game_type = row['game_type'] or 'RNG'
 
-        # 权重 = 时间衰减 × 时长权重
         weight = (decay_factor ** days_ago) * math.log(1 + duration / 60)
-
-        weighted_sum += volatility * weight
+        weighted_rtp_sum += rtp * weight
         weight_total += weight
 
-    # 加权平均波动性 (1-5)
-    avg_volatility = weighted_sum / weight_total
+        # 统计游戏类型
+        if 'crash' in game_type.lower() or 'aviator' in game_type.lower():
+            game_type_counts['CRASH'] += weight
+        else:
+            game_type_counts[game_type] = game_type_counts.get(game_type, 0) + weight
 
-    # 归一化到 [0, 1]: (avg - 1) / (5 - 1)
-    risk_score = round((avg_volatility - 1) / 4, 3)
-    risk_score = max(0, min(1, risk_score))  # 确保在[0,1]范围内
+    avg_rtp = weighted_rtp_sum / weight_total
 
-    # 离散化
-    if risk_score < 0.33:
-        risk_preference = 0  # low
-    elif risk_score < 0.67:
-        risk_preference = 1  # medium
+    # RTP分数：RTP范围通常92-98%，使用敏感区间94-97%
+    # 高RTP(>97%) → 保守(0), 低RTP(<94%) → 激进(1)
+    # 注意：RTP与风险是反向关系
+    RTP_LOW = 94.0   # 低于此值视为激进
+    RTP_HIGH = 97.0  # 高于此值视为保守
+
+    if avg_rtp >= RTP_HIGH:
+        rtp_score = 0.0  # 保守
+    elif avg_rtp <= RTP_LOW:
+        rtp_score = 1.0  # 激进
     else:
-        risk_preference = 2  # high
+        # 线性映射：97→0, 94→1
+        rtp_score = (RTP_HIGH - avg_rtp) / (RTP_HIGH - RTP_LOW)
+
+    # ============ 维度2: 游戏类型偏好 (权重20%) ============
+    # Crash类游戏玩家通常风险偏好更高
+    total_weight = sum(game_type_counts.values())
+    crash_ratio = game_type_counts['CRASH'] / total_weight if total_weight > 0 else 0
+    # Live Casino (LC) 玩家相对保守
+    lc_ratio = game_type_counts.get('LC', 0) / total_weight if total_weight > 0 else 0
+
+    gametype_score = crash_ratio * 1.0 + (1 - lc_ratio) * 0.3  # Crash玩家激进，LC玩家保守
+    gametype_score = min(1.0, gametype_score)
+
+    # ============ 维度3: 投注集中度 (权重20%) ============
+    concentration_data = query("""
+        SELECT
+            COUNT(DISTINCT game_id) AS distinct_games,
+            COUNT(*) AS total_plays
+        FROM user_behaviors
+        WHERE user_id = :user_id
+          AND behavior_type = 'play'
+          AND behavior_time >= DATE_SUB(:T, INTERVAL 29 DAY)
+    """, user_id=user_id, T=T)
+
+    distinct_games = concentration_data['distinct_games'] or 1
+    total_plays = concentration_data['total_plays'] or 1
+
+    # 集中度 = 平均每游戏玩的次数，越高越集中
+    concentration = total_plays / distinct_games
+    # 高集中度（>5次/游戏）可能表示更专注/冒险
+    concentration_score = min(1.0, (concentration - 1) / 4)  # 1次→0, 5次→1
+
+    # ============ 维度4: 投注金额 (权重20%) ============
+    bet_data = query("""
+        SELECT AVG(bet_amount) AS avg_bet
+        FROM user_behaviors
+        WHERE user_id = :user_id
+          AND behavior_type = 'play'
+          AND bet_amount > 0
+          AND behavior_time >= DATE_SUB(:T, INTERVAL 29 DAY)
+    """, user_id=user_id, T=T)
+
+    avg_bet = bet_data['avg_bet'] or 0
+
+    # 需要全局中位数作为基准（假设为10）
+    GLOBAL_MEDIAN_BET = 10.0  # 需从数据统计获取
+
+    # 高于中位数2倍视为高风险投注
+    if avg_bet >= GLOBAL_MEDIAN_BET * 2:
+        bet_score = 1.0
+    elif avg_bet <= GLOBAL_MEDIAN_BET * 0.5:
+        bet_score = 0.0
+    else:
+        bet_score = (avg_bet - GLOBAL_MEDIAN_BET * 0.5) / (GLOBAL_MEDIAN_BET * 1.5)
+
+    # ============ 综合计算 ============
+    risk_score = (
+        0.40 * rtp_score +          # RTP偏好（主要信号）
+        0.20 * gametype_score +     # 游戏类型
+        0.20 * concentration_score + # 投注集中度
+        0.20 * bet_score            # 投注金额
+    )
+    risk_score = round(max(0, min(1, risk_score)), 3)
+
+    # 离散化（使用非均匀阈值，因为RTP分布集中）
+    if risk_score < 0.35:
+        risk_preference = 0  # 保守
+    elif risk_score < 0.65:
+        risk_preference = 1  # 中等
+    else:
+        risk_preference = 2  # 激进
 
     return {
         'risk_preference': risk_preference,
-        'risk_score': risk_score
+        'risk_score': risk_score,
+        # 调试信息（可选，用于分析）
+        '_debug': {
+            'avg_rtp': round(avg_rtp, 2),
+            'rtp_score': round(rtp_score, 3),
+            'gametype_score': round(gametype_score, 3),
+            'concentration_score': round(concentration_score, 3),
+            'bet_score': round(bet_score, 3)
+        }
     }
 ```
 
-**波动性分数映射：**
+**风险偏好各维度权重说明：**
 
-| games.volatility | volatility_score |
-| ---------------- | ---------------- |
-| low              | 1.5              |
-| medium           | 2.5              |
-| high             | 3.5              |
-| very_high        | 4.5              |
+| 维度       | 权重 | 数据来源                             | 说明                     |
+| ---------- | ---- | ------------------------------------ | ------------------------ |
+| RTP偏好    | 40%  | `overseas_casino_game.n_hit_rate`  | 主要信号，低RTP=愿意冒险 |
+| 游戏类型   | 20%  | `overseas_casino_game.s_data_type` | Crash类玩家更激进        |
+| 投注集中度 | 20%  | `user_behaviors` 聚合              | 高集中度可能表示冒险     |
+| 投注金额   | 20%  | `user_behaviors.bet_amount`        | 大额投注=高风险承受      |
+
+**RTP与风险偏好的映射逻辑：**
+
+```
+RTP ≥ 97%  →  保守型（risk_score 趋向 0）
+RTP 94-97% →  中等型（线性映射）
+RTP ≤ 94%  →  激进型（risk_score 趋向 1）
+
+注意：这是反向映射
+高RTP = 理论收益稳定 = 用户追求稳定 = 保守
+低RTP = 理论收益低但可能有大奖 = 用户追求博弈 = 激进
+```
 
 **边界情况：**
 
-- 无play行为：`risk_preference=1, risk_score=0.500`（中等风险）
+| 情况          | 处理方式                                            |
+| ------------- | --------------------------------------------------- |
+| 无play行为    | `risk_preference=1, risk_score=0.500`（默认中等） |
+| RTP数据缺失   | 该维度得分使用0.5（中性值）                         |
+| 投注金额全为0 | bet_score使用0.5                                    |
+| 游戏类型未知  | gametype_score使用0.3（偏保守）                     |
+
+**数据质量说明：**
+
+> **当前方案的局限性：**
+>
+> 1. RTP分布集中在94-98%区间，区分度有限
+> 2. 缺少真实波动性数据，多维度评估是近似方案
+> 3. 全局中位数（GLOBAL_MEDIAN_BET）需要定期从数据统计更新
+>
+> **改进方案：**
+>
+> - 如果能从游戏供应商获取波动性数据，补充到 `overseas_casino_game` 表
+> - 有了波动性数据后，可将 RTP 权重降至 20%，波动性权重提升至 40%
 
 ---
 
@@ -850,9 +983,13 @@ CREATE TABLE algo_game_features (
     provider_id SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '提供商ID (已编码)',
 
     -- 核心属性 (已数值化)
-    rtp DECIMAL(5,2) DEFAULT NULL COMMENT 'RTP返还率 (如96.50)',
-    volatility TINYINT UNSIGNED DEFAULT 1 COMMENT '波动性: 0-low 1-medium 2-high 3-very_high',
-    volatility_score DECIMAL(3,2) DEFAULT 2.50 COMMENT '波动性数值 1.00-5.00',
+    -- RTP数据来源: overseas_casino_game.n_hit_rate
+    rtp DECIMAL(5,2) DEFAULT NULL COMMENT 'RTP返还率 (如96.50), 来源:n_hit_rate',
+
+    -- ⚠️ 波动性字段：当前业务数据库无此数据，预留字段待供应商提供
+    -- 如果未来获取到波动性数据，可启用以下字段
+    volatility TINYINT UNSIGNED DEFAULT NULL COMMENT '波动性: 0-low 1-medium 2-high 3-very_high (待供应商提供)',
+    volatility_score DECIMAL(3,2) DEFAULT NULL COMMENT '波动性数值 1.00-5.00 (待供应商提供)',
 
     -- 投注范围
     min_bet DECIMAL(10,2) DEFAULT 0.10 COMMENT '最小投注',
@@ -921,10 +1058,32 @@ CREATE INDEX idx_status ON algo_game_features(status);
 
 **ETL要求（给大数据工程师）：**
 
+**数据来源映射：**
+
+| algo_game_features 字段 | 业务表来源           | 业务字段             | 说明                                    |
+| ----------------------- | -------------------- | -------------------- | --------------------------------------- |
+| game_id                 | overseas_casino_game | s_game_id            | 游戏唯一标识                            |
+| category_id             | overseas_casino_game | n_type               | 需要编码映射                            |
+| provider_id             | overseas_casino_game | s_agent_code         | 需要编码映射                            |
+| **rtp**           | overseas_casino_game | **n_hit_rate** | 直接使用，范围92-98                     |
+| volatility              | -                    | -                    | **⚠️ 业务表无此字段，暂为NULL** |
+| volatility_score        | -                    | -                    | **⚠️ 业务表无此字段，暂为NULL** |
+| status                  | overseas_casino_game | n_status             | 0-禁用 1-启用                           |
+| is_new                  | overseas_casino_game | n_category           | n_category IN (1,3) 视为新游戏          |
+| is_featured             | overseas_casino_game | n_category           | n_category IN (2,3) 视为热门            |
+
+**计算规则：**
+
 - 热度分数：需归一化到0-1范围，公式：`score = log(1 + count) / log(1 + max_count)`
 - 主题/特性位图：需要提供编码映射表
 - 小时级任务：仅更新 `hot_score_*` 和 `play_count_*` 字段
-- 状态同步：与业务系统保持一致
+- 状态同步：与业务系统 `overseas_casino_game.n_status` 保持一致
+
+**波动性数据补充说明：**
+
+> 当前 `volatility` 和 `volatility_score` 字段暂时为 NULL。
+> 如果未来从游戏供应商（Pragmatic Play、Evolution等）获取到波动性数据，
+> 需要建立数据同步机制，并更新用户风险偏好计算逻辑的权重分配。
 
 ---
 
