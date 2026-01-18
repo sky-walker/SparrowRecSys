@@ -45,7 +45,7 @@
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         数据存储层                                    │
 │  ┌──────────┬──────────┬──────────┬──────────────────────────────┐ │
-│  │  Redis   │PostgreSQL│  FAISS   │       特征存储 (Redis)        │ │
+│  │  Redis   │  MySQL   │  FAISS   │       特征存储 (Redis)        │ │
 │  │ (缓存)   │ (业务DB) │(向量索引) │                              │ │
 │  └──────────┴──────────┴──────────┴──────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────┘
@@ -77,7 +77,7 @@
 | 6路召回 | 4路召回 (热门+Item-CF+内容+新游戏) | 足够覆盖主要场景 |
 | Kafka+Flink 实时特征 | Redis + 定时任务 | 降低运维复杂度 |
 | Triton Inference | TorchServe 或直接 FastAPI 推理 | Python 原生更简单 |
-| MySQL+HBase | PostgreSQL + Redis | 单一数据库简化运维 |
+| MySQL+HBase | MySQL + Redis | 单一数据库简化运维 |
 | 复杂的 DIEN/MMOE | DeepFM + 简化版 DIN | MVP 阶段足够 |
 
 ---
@@ -1071,7 +1071,7 @@ class NewGameColdStart:
 
 | 存储 | 用途 | 说明 |
 |------|------|------|
-| **PostgreSQL** | 业务数据 | 用户、游戏、行为日志 |
+| **MySQL** | 业务数据 | 用户、游戏、行为日志 |
 | **Redis** | 缓存+特征 | 实时特征、相似矩阵、推荐缓存 |
 | **FAISS** | 向量索引 | 双塔模型召回 |
 | **MinIO/S3** | 模型存储 | 训练模型、Embedding 文件 |
@@ -1087,7 +1087,7 @@ class NewGameColdStart:
 │  │ (API)   │ │(Worker) │ │ (Cache)  │  │
 │  └─────────┘ └─────────┘ └──────────┘  │
 │  ┌─────────┐ ┌─────────┐               │
-│  │PostgreSQL│ │ Nginx  │               │
+│  │  MySQL  │ │ Nginx   │               │
 │  │  (DB)   │ │(Gateway)│               │
 │  └─────────┘ └─────────┘               │
 └─────────────────────────────────────────┘
@@ -1212,28 +1212,7 @@ Response:
 }
 ```
 
-### 6.2 行为上报接口
-
-```
-POST /api/v1/behavior/track
-
-Request Body:
-{
-    "user_id": "user_001",
-    "game_id": "aviator",
-    "behavior_type": "play",
-    "duration": 300,
-    "bet_amount": 100.00
-}
-
-Response:
-{
-    "code": 0,
-    "message": "success"
-}
-```
-
-### 6.3 管理接口
+### 6.2 管理接口
 
 ```
 # 刷新热门榜单
@@ -1260,7 +1239,6 @@ game-recommendation-system/
 │   │   ├── __init__.py
 │   │   ├── routes/
 │   │   │   ├── recommend.py    # 推荐接口
-│   │   │   ├── behavior.py     # 行为上报
 │   │   │   └── admin.py        # 管理接口
 │   ├── core/
 │   │   ├── __init__.py
@@ -1385,7 +1363,6 @@ pip install fastapi uvicorn sqlalchemy redis pydantic
 | 任务 | 具体内容 | 产出物 | 验收标准 |
 |------|----------|--------|----------|
 | 推荐接口 | 完整推荐链路 | recommend.py | 端到端可用 |
-| 行为上报 | 行为记录、序列更新 | behavior.py | 行为入库 |
 | 链路测试 | 端到端测试 | test_api.py | 全链路通过 |
 | 性能优化 | 缓存、批处理 | - | P99 < 100ms |
 
@@ -1477,7 +1454,7 @@ pip install fastapi uvicorn sqlalchemy redis pydantic
 
 我已经为您完成了详细的技术方案和开发计划。接下来您可以考虑：
 
-1. **确认技术选型**：您对 FastAPI + PyTorch + PostgreSQL + Redis 的技术栈是否满意？
+1. **确认技术选型**：您对 FastAPI + PyTorch + MySQL + Redis 的技术栈是否满意？
 2. **开始 MVP 开发**：如果方案符合预期，我可以帮您开始创建项目骨架代码
 3. **调整简化程度**：如果某些简化不符合需求（如需要 Kafka 实时流处理），可以调整方案
 4. **生成详细的设计文档**：如果需要，我可以将此方案保存为 Markdown 文档到项目中
